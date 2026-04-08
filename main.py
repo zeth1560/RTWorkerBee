@@ -1,10 +1,3 @@
-"""
-ReplayTrove Windows pilot worker: watch clips folder, upload to S3, insert Supabase rows.
-
-Run:  python main.py
-Optional:  python main.py --env path\\.env
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -77,7 +70,6 @@ def main(argv: list[str] | None = None) -> int:
                 "club_id": settings.club_id,
                 "court_id": settings.court_id,
                 "primary_bucket": settings.s3_bucket,
-                "scott_bucket": settings.scott_s3_bucket,
             }
         },
     )
@@ -100,16 +92,6 @@ def main(argv: list[str] | None = None) -> int:
         label="primary",
     )
 
-    scott_uploader = S3Uploader(
-        bucket=settings.scott_s3_bucket,
-        region=settings.scott_aws_region,
-        access_key_id=settings.scott_aws_access_key_id,
-        secret_access_key=settings.scott_aws_secret_access_key,
-        upload_retries=settings.upload_retries,
-        upload_retry_delay_seconds=settings.upload_retry_delay_seconds,
-        label="scott",
-    )
-
     job_queue = ClipJobQueue()
     stop = threading.Event()
 
@@ -120,9 +102,12 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             try:
-                process_clip(path, settings, primary_uploader, scott_uploader, supabase)
+                process_clip(path, settings, primary_uploader, supabase)
             except Exception:
-                pass
+                logger.exception(
+                    "Worker failed processing clip",
+                    extra={"structured": {"path": str(path)}},
+                )
             finally:
                 job_queue.mark_done(path)
                 job_queue.task_done()

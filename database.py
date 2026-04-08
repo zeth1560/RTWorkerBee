@@ -8,6 +8,7 @@ import logging
 from typing import Any
 
 from supabase import Client, create_client
+from postgrest.exceptions import APIError
 
 from config import Settings
 
@@ -31,8 +32,9 @@ def insert_clip_record(
     """
     Insert one clip row.
 
-    Returns the first inserted row dict when available.
+    If a duplicate s3_key exists, return the existing row instead of failing.
     """
+
     row = {
         "title": title,
         "slug": slug,
@@ -56,23 +58,61 @@ def insert_clip_record(
         },
     )
 
-    response = client.table(settings.supabase_clips_table).insert(row).execute()
+    try:
+        response = (
+            client.table(settings.supabase_clips_table)
+            .insert(row)
+            .execute()
+        )
 
-    logger.info(
-        "Supabase insert completed",
-        extra={
-            "structured": {
-                "table": settings.supabase_clips_table,
-                "slug": slug,
-                "recorded_at": recorded_at,
-            }
-        },
-    )
+        logger.info(
+            "Supabase insert completed",
+            extra={
+                "structured": {
+                    "table": settings.supabase_clips_table,
+                    "slug": slug,
+                    "recorded_at": recorded_at,
+                }
+            },
+        )
 
-    data = getattr(response, "data", None)
-    if data and isinstance(data, list) and len(data) > 0:
-        return data[0]
-    return row
+        data = getattr(response, "data", None)
+        if data and isinstance(data, list) and len(data) > 0:
+            return data[0]
+
+        return row
+
+    except APIError as e:
+        error_message = str(e)
+
+        # 👇 HANDLE DUPLICATE s3_key CLEANLY
+        if "duplicate key value violates unique constraint" in error_message:
+            logger.warning(
+                "Duplicate clip detected, fetching existing record",
+                extra={
+                    "structured": {
+                        "s3_key": s3_key,
+                    }
+                },
+            )
+
+            existing = (
+                client.table(settings.supabase_clips_table)
+                .select("*")
+                .eq("s3_key", s3_key)
+                .limit(1)
+                .execute()
+            )
+
+            data = getattr(existing, "data", None)
+            if data and len(data) > 0:
+                return data[0]
+
+            # fallback if somehow not found
+            return row
+
+        # 🚨 REAL ERROR → re-raise
+        raise
 
 
 def update_clip_booking_id(

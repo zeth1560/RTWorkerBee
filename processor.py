@@ -4,7 +4,6 @@ End-to-end processing for a single clip: stabilize, rename to UTC, preview, uplo
 
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 import subprocess
@@ -223,16 +222,6 @@ def build_s3_keys(settings: Settings, original_name: str, preview_name: str) -> 
     return orig_key, prev_key
 
 
-def build_scott_keys(settings: Settings, preview_name: str, meta_name: str) -> tuple[str, str]:
-    preview_prefix = settings.scott_s3_preview_prefix.strip("/")
-    meta_prefix = settings.scott_s3_meta_prefix.strip("/")
-
-    preview_key = f"{preview_prefix}/{preview_name}" if preview_prefix else preview_name
-    meta_key = f"{meta_prefix}/{meta_name}" if meta_prefix else meta_name
-
-    return preview_key, meta_key
-
-
 def resolve_ffmpeg_path(settings: Settings) -> str:
     ffmpeg_path = Path(str(settings.ffmpeg_path))
 
@@ -402,34 +391,10 @@ def get_booking_id_for_clip(settings: Settings, recorded_at: str) -> str | None:
     return None
 
 
-def write_scott_metadata_file(
-    metadata_path: Path,
-    *,
-    filename: str,
-    captured_at_utc: str,
-    club_id: str,
-    court_id: str,
-    slug: str,
-) -> None:
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-
-    payload = {
-        "filename": filename,
-        "captured_at_utc": captured_at_utc,
-        "club_id": club_id,
-        "court_id": court_id,
-        "source": "ReplayTrove",
-        "slug": slug,
-    }
-
-    metadata_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
 def process_clip(
     clip_path: Path,
     settings: Settings,
     primary_uploader: S3Uploader,
-    scott_uploader: S3Uploader,
     supabase: Client,
 ) -> None:
     original_input_path = clip_path.resolve(strict=False)
@@ -475,9 +440,6 @@ def process_clip(
         original_name = clip_path.name
         preview_name = build_preview_filename(clip_path)
         preview_path = (settings.preview_folder / preview_name).resolve(strict=False)
-
-        meta_name = f"{clip_path.stem}.json"
-        meta_path = (settings.preview_folder / meta_name).resolve(strict=False)
 
         captured_at_utc = parse_captured_at_utc(clip_path)
 
@@ -556,34 +518,6 @@ def process_clip(
                 },
             )
 
-        write_scott_metadata_file(
-            meta_path,
-            filename=preview_name,
-            captured_at_utc=captured_at_utc,
-            club_id=settings.club_id,
-            court_id=settings.court_id,
-            slug=slug,
-        )
-
-        try:
-            scott_preview_key, scott_meta_key = build_scott_keys(settings, preview_name, meta_name)
-            scott_uploader.upload_file(preview_path, scott_preview_key)
-            scott_uploader.upload_file(meta_path, scott_meta_key)
-            logger.info(
-                "Scott handoff completed",
-                extra={
-                    "structured": {
-                        "preview_key": scott_preview_key,
-                        "meta_key": scott_meta_key,
-                    }
-                },
-            )
-        except Exception:
-            logger.exception(
-                "Scott handoff failed (non-fatal)",
-                extra={"structured": {"path": str(clip_path)}},
-            )
-
         dest = unique_destination(settings.processed_folder, original_name)
         move_with_retries(
             clip_path,
@@ -598,7 +532,6 @@ def process_clip(
                 "structured": {
                     "original": str(dest),
                     "preview": str(preview_path),
-                    "meta": str(meta_path),
                     "slug": slug,
                     "recorded_at": captured_at_utc,
                 }
@@ -621,13 +554,11 @@ def process_clip(
                 )
                 logger.info(
                     "Moved failed clip",
-                    extra={"structured": {"path": str(dest)}},
-                )
+                    extra={"structured": {"path": str(dest)}}),
         except Exception:
             logger.exception(
                 "Could not move failed clip to failed folder",
-                extra={"structured": {"path": str(clip_path)}},
-            )
+                extra={"structured": {"path": str(clip_path)}})
         raise
     finally:
         _release_path(original_input_path)
