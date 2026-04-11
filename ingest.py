@@ -149,7 +149,7 @@ def _instant_replay_try_promote(
         return
 
     name = _local_timestamp_basename(settings, suffix)
-    final_dest = unique_destination(settings.clips_folder, name)
+    final_dest = unique_destination(settings.clips_incoming_folder, name)
     temp_dest = final_dest.with_name(final_dest.stem + ".copying" + final_dest.suffix)
 
     logger.info(
@@ -402,7 +402,7 @@ def _long_clips_scan_pass(
 
         suffix = entry.suffix.lower() if entry.suffix else ".mp4"
         name = _local_timestamp_basename(settings, suffix)
-        final_dest = unique_destination(settings.clips_folder, name)
+        final_dest = unique_destination(settings.clips_incoming_folder, name)
         temp_dest = final_dest.with_name(final_dest.stem + ".copying" + final_dest.suffix)
 
         logger.info(
@@ -485,11 +485,16 @@ def long_clips_ingest_loop(
         return
 
     folder = folder.resolve(strict=False)
-    clips_root = settings.clips_folder.resolve(strict=False)
+    clips_root = settings.clips_incoming_folder.resolve(strict=False)
     if folder == clips_root:
         logger.error(
-            "Long clips folder must not be the same as the clips folder; long ingest disabled",
-            extra={"structured": {"folder": str(folder), "clips_folder": str(clips_root)}},
+            "Long clips folder must not be the same as the incoming clips folder; long ingest disabled",
+            extra={
+                "structured": {
+                    "folder": str(folder),
+                    "clips_incoming_folder": str(clips_root),
+                }
+            },
         )
         return
 

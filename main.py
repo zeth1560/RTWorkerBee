@@ -16,9 +16,16 @@ from ingest import (
     long_clips_ingest_loop,
 )
 from logger import setup_logging
+from job_store import JobStore
 from processor import is_copying_temp_clip, process_clip
 from uploader import S3Uploader
-from watcher import ClipFileHandler, ClipJobQueue, scan_existing_clips, start_observer
+from watcher import (
+    ClipFileHandler,
+    ClipJobQueue,
+    scan_existing_clips,
+    scan_processing_resume,
+    start_observer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +43,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def _ensure_directories(settings: Settings) -> None:
     folders = [
-        settings.clips_folder,
+        settings.clips_incoming_folder,
+        settings.clips_processing_folder,
         settings.preview_folder,
         settings.processed_folder,
         settings.failed_folder,
@@ -84,7 +92,9 @@ def main(argv: list[str] | None = None) -> int:
         "Worker initialized",
         extra={
             "structured": {
-                "clips_folder": str(settings.clips_folder),
+                "clips_incoming_folder": str(settings.clips_incoming_folder),
+                "clips_processing_folder": str(settings.clips_processing_folder),
+                "job_db_path": str(settings.job_db_path),
                 "preview_folder": str(settings.preview_folder),
                 "processed_folder": str(settings.processed_folder),
                 "failed_folder": str(settings.failed_folder),
@@ -137,7 +147,12 @@ def main(argv: list[str] | None = None) -> int:
         upload_retries=settings.upload_retries,
         upload_retry_delay_seconds=settings.upload_retry_delay_seconds,
         label="primary",
+        multipart_threshold_bytes=settings.s3_multipart_threshold_bytes,
+        multipart_chunksize_bytes=settings.s3_multipart_chunksize_bytes,
     )
+
+    job_store = JobStore(settings.job_db_path)
+    job_store.init_schema()
 
     job_queue = ClipJobQueue(settings)
     stop = threading.Event()
@@ -160,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             try:
-                process_clip(path, settings, primary_uploader, supabase)
+                process_clip(path, settings, primary_uploader, supabase, job_store)
             except Exception:
                 logger.exception(
                     "Worker failed processing clip",
@@ -239,9 +254,15 @@ def main(argv: list[str] | None = None) -> int:
 
     logger.info(
         "Scanning existing clips on startup",
-        extra={"structured": {"clips_folder": str(settings.clips_folder)}},
+        extra={
+            "structured": {
+                "clips_incoming_folder": str(settings.clips_incoming_folder),
+                "clips_processing_folder": str(settings.clips_processing_folder),
+            }
+        },
     )
     scan_existing_clips(settings, submit_job)
+    scan_processing_resume(settings, submit_job)
 
     def handle_signal(signum: int, _frame: object | None) -> None:
         logger.info(

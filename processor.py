@@ -20,7 +20,19 @@ import requests
 from supabase import Client
 
 from config import Settings, slug_from_stem
-from database import insert_clip_record, update_clip_booking_id
+from database import update_clip_booking_id, upsert_clip_record
+from job_store import (
+    JobIdempotencyCollisionError,
+    JobStore,
+    STEP_BOOKING,
+    STEP_DB_UPSERT,
+    STEP_FINALIZED,
+    STEP_PREVIEW,
+    STEP_RENAMED_UTC,
+    STEP_UPLOAD_ORIGINAL,
+    STEP_UPLOAD_PREVIEW,
+    make_idempotency_key,
+)
 from uploader import S3Uploader
 
 logger = logging.getLogger(__name__)
@@ -860,14 +872,25 @@ def get_booking_id_for_clip(settings: Settings, recorded_at: str) -> str | None:
     return None
 
 
+def _deterministic_slug(stem: str, idempotency_key: str) -> str:
+    base = slug_from_stem(stem)
+    return f"{base}-{idempotency_key[:12]}"
+
+
 def process_clip(
     clip_path: Path,
     settings: Settings,
     primary_uploader: S3Uploader,
     supabase: Client,
+    job_store: JobStore,
 ) -> None:
+    job_store.init_schema()
+    incoming = settings.clips_incoming_folder.resolve(strict=False)
+    processing = settings.clips_processing_folder.resolve(strict=False)
+
     original_input_path = clip_path.resolve(strict=False)
     clip_path = original_input_path
+    parent = clip_path.parent.resolve(strict=False)
 
     if not is_video_file(clip_path, settings):
         logger.info("Skipping non-video file", extra={"structured": {"path": str(clip_path)}})
@@ -887,9 +910,9 @@ def process_clip(
         )
         return
 
-    if clip_path.parent.resolve(strict=False) != settings.clips_folder.resolve(strict=False):
+    if parent not in (incoming, processing):
         logger.info(
-            "Skipping file outside clips folder",
+            "Skipping file outside incoming/processing folders",
             extra={"structured": {"path": str(clip_path)}},
         )
         return
@@ -908,262 +931,404 @@ def process_clip(
         )
         return
 
+    idem: str | None = None
     logger.info("Processing clip", extra={"structured": {"path": str(clip_path)}})
 
     pipeline_db_persisted = False
     pipeline_upload_started = False
 
     try:
-        if is_recently_completed_clip(clip_path):
-            logger.info(
-                "Skipping recently completed clip (duplicate watcher/submit)",
-                extra={"structured": {"path": str(clip_path)}},
-            )
-            return
-
-        if _is_in_recent_failure_cooldown(clip_path, settings):
-            logger.info(
-                "Skipping clip during recent-failure cooldown",
-                extra={
-                    "structured": {
-                        "path": str(clip_path),
-                        "cooldown_seconds": settings.recent_failure_cooldown_seconds,
-                    }
-                },
-            )
-            return
-
-        try:
-            if not clip_readiness_gate(clip_path, settings):
-                _mark_recent_failure(clip_path)
+        if parent == processing:
+            job = job_store.ensure_job_for_processing_file(clip_path)
+            idem = job.idempotency_key
+            if job.status == "completed":
                 logger.info(
-                    "Deferred clip: readiness gate (leave for retry)",
+                    "Job already finalized in DB; skipping",
+                    extra={"structured": {"idempotency_key": idem}},
+                )
+                return
+        else:
+            if is_recently_completed_clip(clip_path):
+                logger.info(
+                    "Skipping recently completed clip (duplicate watcher/submit)",
                     extra={"structured": {"path": str(clip_path)}},
                 )
                 return
 
-            wait_until_stable(clip_path, settings)
-            _clear_recent_failure(clip_path)
-        except FileNotFoundError:
-            logger.info(
-                "Clip no longer present when processing started; skipping duplicate watcher event",
-                extra={"structured": {"path": str(clip_path)}},
-            )
-            return
-        except FileLockedError:
-            _mark_recent_failure(clip_path)
-            if settings.locked_file_requeue_delay_seconds > 0:
-                time.sleep(settings.locked_file_requeue_delay_seconds)
-            logger.info(
-                "Clip still locked by another process; leaving in place for later retry",
-                extra={"structured": {"path": str(clip_path)}},
-            )
-            return
-        except FileStillChangingError:
-            _mark_recent_failure(clip_path)
-            logger.info(
-                "Clip still changing; leaving in place for later retry",
-                extra={"structured": {"path": str(clip_path)}},
-            )
-            return
-
-        try:
-            clip_path = rename_clip_to_utc_filename(
-                clip_path,
-                settings=settings,
-                local_tz_name=settings.local_timezone,
-                retries=settings.move_retries,
-                delay_seconds=settings.move_retry_delay_seconds,
-            )
-        except FileNotFoundError:
-            logger.info(
-                "Clip missing before UTC rename; skipping (no further retries)",
-                extra={"structured": {"path": str(clip_path)}},
-            )
-            return
-
-        original_name = clip_path.name
-        preview_name = build_preview_filename(clip_path)
-        preview_path = (settings.preview_folder / preview_name).resolve(strict=False)
-
-        captured_at_utc = parse_captured_at_utc(clip_path)
-
-        try:
-            run_ffmpeg_preview(settings, clip_path, preview_path)
-        except FfmpegDecodeError as exc:
-            key = _path_key(clip_path)
-            with _FFMPEG_SOFT_FAILS_LOCK:
-                n = _FFMPEG_SOFT_FAILS.get(key, 0) + 1
-                _FFMPEG_SOFT_FAILS[key] = n
-            max_soft = settings.ffmpeg_decode_max_soft_fails
-
-            if n < max_soft:
-                logger.warning(
-                    "ffmpeg decode/corruption failure; deferring clip for retry",
+            if _is_in_recent_failure_cooldown(clip_path, settings):
+                logger.info(
+                    "Skipping clip during recent-failure cooldown",
                     extra={
                         "structured": {
                             "path": str(clip_path),
-                            "attempt": n,
-                            "max_soft_fails": max_soft,
-                            "error": str(exc)[:500],
+                            "cooldown_seconds": settings.recent_failure_cooldown_seconds,
                         }
                     },
-                )
-                _mark_recent_failure(clip_path)
-                rd = settings.ffmpeg_decode_retry_delay_seconds
-                if rd > 0:
-                    time.sleep(rd)
-                return
-
-            with _FFMPEG_SOFT_FAILS_LOCK:
-                _FFMPEG_SOFT_FAILS.pop(key, None)
-
-            logger.error(
-                "ffmpeg decode failed after repeated attempts; moving to failed if possible",
-                extra={
-                    "structured": {
-                        "path": str(clip_path),
-                        "attempts": n,
-                        "error": str(exc)[:500],
-                    }
-                },
-            )
-
-            if is_file_locked(clip_path):
-                logger.warning(
-                    "Failed clip still locked after decode errors; leaving in clips for retry",
-                    extra={"structured": {"path": str(clip_path)}},
-                )
-                return
-
-            if not _owns_active_processing_claim(original_input_path):
-                logger.warning(
-                    "Skipping failed-folder move (not active processing owner)",
-                    extra={"structured": {"path": str(clip_path)}},
                 )
                 return
 
             try:
-                dest = unique_destination(settings.failed_folder, clip_path.name)
-                moved_fail = move_if_exists(
-                    clip_path,
-                    dest,
-                    retries=settings.move_retries,
-                    delay_seconds=settings.move_retry_delay_seconds,
-                    context="failed_after_ffmpeg_decode",
-                )
-                if moved_fail is not None:
+                if not clip_readiness_gate(clip_path, settings):
+                    _mark_recent_failure(clip_path)
                     logger.info(
-                        "Moved clip to failed after repeated ffmpeg decode errors",
-                        extra={"structured": {"path": str(moved_fail)}},
+                        "Deferred clip: readiness gate (leave for retry)",
+                        extra={"structured": {"path": str(clip_path)}},
                     )
-            except Exception:
-                logger.exception(
-                    "Could not move decode-failed clip to failed folder",
+                    return
+
+                wait_until_stable(clip_path, settings)
+                _clear_recent_failure(clip_path)
+            except FileNotFoundError:
+                logger.info(
+                    "Clip no longer present when processing started; skipping duplicate watcher event",
                     extra={"structured": {"path": str(clip_path)}},
                 )
-            return
+                return
+            except FileLockedError:
+                _mark_recent_failure(clip_path)
+                if settings.locked_file_requeue_delay_seconds > 0:
+                    time.sleep(settings.locked_file_requeue_delay_seconds)
+                logger.info(
+                    "Clip still locked by another process; leaving in place for later retry",
+                    extra={"structured": {"path": str(clip_path)}},
+                )
+                return
+            except FileStillChangingError:
+                _mark_recent_failure(clip_path)
+                logger.info(
+                    "Clip still changing; leaving in place for later retry",
+                    extra={"structured": {"path": str(clip_path)}},
+                )
+                return
 
-        _clear_ffmpeg_soft_fails(clip_path)
+            st = clip_path.stat()
+            idem = make_idempotency_key(clip_path.name, st.st_size)
+            prior = job_store.get(idem)
+            if prior is not None and prior.status == "completed":
+                logger.info(
+                    "Idempotent skip: asset already completed",
+                    extra={"structured": {"idempotency_key": idem}},
+                )
+                return
+            if prior is not None and prior.status == "processing":
+                logger.warning(
+                    "Same idempotency key already has an active job; skipping duplicate file",
+                    extra={"structured": {"idempotency_key": idem}},
+                )
+                return
 
-        s3_original_key, s3_preview_key = build_s3_keys(settings, original_name, preview_name)
+            dest = processing / clip_path.name
+            if dest.exists():
+                dest = unique_destination(processing, clip_path.name)
+            try:
+                clip_path.rename(dest)
+            except OSError as exc:
+                logger.warning(
+                    "Atomic claim rename failed",
+                    extra={"structured": {"from": str(clip_path), "error": str(exc)}},
+                )
+                return
 
-        pipeline_upload_started = True
-        primary_uploader.upload_file(clip_path, s3_original_key)
-        primary_uploader.upload_file(preview_path, s3_preview_key)
+            clip_path = dest.resolve(strict=False)
+            _release_path(original_input_path)
+            if not _claim_path(clip_path):
+                return
+            original_input_path = clip_path
 
-        stem_slug = slug_from_stem(clip_path.stem)
-        slug = f"{stem_slug}-{uuid.uuid4().hex[:10]}"
-        title = clip_path.stem
+            try:
+                job = job_store.insert_after_claim(
+                    idempotency_key=idem,
+                    incoming_basename=clip_path.name,
+                    processing_path=clip_path,
+                    file_size=st.st_size,
+                )
+            except JobIdempotencyCollisionError:
+                logger.warning(
+                    "Job row collision after rename; leaving file in processing for recovery",
+                    extra={"structured": {"idempotency_key": idem}},
+                )
+                return
 
-        inserted_clip = insert_clip_record(
-            supabase,
-            settings,
-            title=title,
-            slug=slug,
-            s3_key=s3_original_key,
-            preview_s3_key=s3_preview_key,
-            recorded_at=captured_at_utc,
+        assert idem is not None
+        job = job_store.get(idem)
+        assert job is not None
+
+        flags = job.step_flags
+
+        if not (flags & STEP_RENAMED_UTC):
+            try:
+                clip_path = rename_clip_to_utc_filename(
+                    clip_path,
+                    settings=settings,
+                    local_tz_name=settings.local_timezone,
+                    retries=settings.move_retries,
+                    delay_seconds=settings.move_retry_delay_seconds,
+                )
+            except FileNotFoundError:
+                logger.info(
+                    "Clip missing before UTC rename; skipping (no further retries)",
+                    extra={"structured": {"path": str(clip_path)}},
+                )
+                return
+            job_store.update_job(
+                idem,
+                merge_steps=True,
+                step_flags=STEP_RENAMED_UTC,
+                utc_filename=clip_path.name,
+                processing_path=str(clip_path.resolve(strict=False)),
+            )
+            flags |= STEP_RENAMED_UTC
+        else:
+            clip_path = Path(job.processing_path).resolve(strict=False)
+            if not clip_path.is_file():
+                logger.warning(
+                    "Resume: processing path missing on disk",
+                    extra={"structured": {"path": str(clip_path), "idempotency_key": idem}},
+                )
+                return
+
+        original_name = clip_path.name
+        preview_name = (
+            job.preview_relpath
+            if job.preview_relpath
+            else build_preview_filename(clip_path)
         )
-        pipeline_db_persisted = True
+        preview_path = (settings.preview_folder / preview_name).resolve(strict=False)
+        captured_at_utc = (
+            job.recorded_at
+            if job.recorded_at
+            else parse_captured_at_utc(clip_path)
+        )
 
-        clip_id = inserted_clip.get("id")
-        if clip_id:
-            booking_id = get_booking_id_for_clip(settings, captured_at_utc)
+        if not (flags & STEP_PREVIEW):
+            try:
+                run_ffmpeg_preview(settings, clip_path, preview_path)
+            except FfmpegDecodeError as exc:
+                key = _path_key(clip_path)
+                with _FFMPEG_SOFT_FAILS_LOCK:
+                    n = _FFMPEG_SOFT_FAILS.get(key, 0) + 1
+                    _FFMPEG_SOFT_FAILS[key] = n
+                max_soft = settings.ffmpeg_decode_max_soft_fails
 
-            if booking_id:
-                try:
-                    update_clip_booking_id(
-                        supabase,
-                        settings,
-                        clip_id=clip_id,
-                        booking_id=booking_id,
-                    )
-                    logger.info(
-                        "Clip matched to booking",
+                if n < max_soft:
+                    logger.warning(
+                        "ffmpeg decode/corruption failure; deferring clip for retry",
                         extra={
                             "structured": {
-                                "clip_id": clip_id,
-                                "booking_id": booking_id,
-                                "recorded_at": captured_at_utc,
+                                "path": str(clip_path),
+                                "attempt": n,
+                                "max_soft_fails": max_soft,
+                                "error": str(exc)[:500],
                             }
                         },
                     )
+                    _mark_recent_failure(clip_path)
+                    rd = settings.ffmpeg_decode_retry_delay_seconds
+                    if rd > 0:
+                        time.sleep(rd)
+                    return
+
+                with _FFMPEG_SOFT_FAILS_LOCK:
+                    _FFMPEG_SOFT_FAILS.pop(key, None)
+
+                logger.error(
+                    "ffmpeg decode failed after repeated attempts; moving to failed if possible",
+                    extra={
+                        "structured": {
+                            "path": str(clip_path),
+                            "attempts": n,
+                            "error": str(exc)[:500],
+                        }
+                    },
+                )
+
+                if is_file_locked(clip_path):
+                    logger.warning(
+                        "Failed clip still locked after decode errors; leaving in processing for retry",
+                        extra={"structured": {"path": str(clip_path)}},
+                    )
+                    return
+
+                if not _owns_active_processing_claim(original_input_path):
+                    return
+
+                try:
+                    dest = unique_destination(settings.failed_folder, clip_path.name)
+                    moved_fail = move_if_exists(
+                        clip_path,
+                        dest,
+                        retries=settings.move_retries,
+                        delay_seconds=settings.move_retry_delay_seconds,
+                        context="failed_after_ffmpeg_decode",
+                    )
+                    if moved_fail is not None:
+                        job_store.update_job(
+                            idem,
+                            status="failed",
+                            last_error="ffmpeg_decode",
+                        )
+                        logger.info(
+                            "Moved clip to failed after repeated ffmpeg decode errors",
+                            extra={"structured": {"path": str(moved_fail)}},
+                        )
                 except Exception:
                     logger.exception(
-                        "Failed to update clip with booking_id",
+                        "Could not move decode-failed clip to failed folder",
+                        extra={"structured": {"path": str(clip_path)}},
+                    )
+                return
+
+            job_store.update_job(
+                idem,
+                merge_steps=True,
+                step_flags=STEP_PREVIEW,
+                preview_relpath=preview_name,
+            )
+            flags |= STEP_PREVIEW
+            _clear_ffmpeg_soft_fails(clip_path)
+
+        s3_original_key, s3_preview_key = build_s3_keys(settings, original_name, preview_name)
+
+        job = job_store.get(idem)
+        assert job is not None
+        slug = job.slug or _deterministic_slug(clip_path.stem, idem)
+        if not job.slug:
+            job_store.update_job(idem, slug=slug)
+
+        if not (flags & STEP_UPLOAD_ORIGINAL):
+            pipeline_upload_started = True
+            primary_uploader.upload_file(clip_path, s3_original_key)
+            job_store.update_job(
+                idem,
+                merge_steps=True,
+                step_flags=STEP_UPLOAD_ORIGINAL,
+                s3_original_key=s3_original_key,
+            )
+            flags |= STEP_UPLOAD_ORIGINAL
+
+        if not (flags & STEP_UPLOAD_PREVIEW):
+            pipeline_upload_started = True
+            primary_uploader.upload_file(preview_path, s3_preview_key)
+            job_store.update_job(
+                idem,
+                merge_steps=True,
+                step_flags=STEP_UPLOAD_PREVIEW,
+                s3_preview_key=s3_preview_key,
+            )
+            flags |= STEP_UPLOAD_PREVIEW
+
+        title = clip_path.stem
+        if not (flags & STEP_DB_UPSERT):
+            inserted_clip = upsert_clip_record(
+                supabase,
+                settings,
+                title=title,
+                slug=slug,
+                s3_key=s3_original_key,
+                preview_s3_key=s3_preview_key,
+                recorded_at=captured_at_utc,
+            )
+            pipeline_db_persisted = True
+            clip_id_val = inserted_clip.get("id")
+            clip_id_str = str(clip_id_val) if clip_id_val is not None else None
+            job_store.update_job(
+                idem,
+                merge_steps=True,
+                step_flags=STEP_DB_UPSERT,
+                clip_id=clip_id_str,
+                recorded_at=captured_at_utc,
+            )
+            flags |= STEP_DB_UPSERT
+        else:
+            inserted_clip = {"id": job.clip_id}
+            pipeline_db_persisted = True
+            flags |= STEP_DB_UPSERT
+
+        clip_id = inserted_clip.get("id")
+        if not (flags & STEP_BOOKING):
+            if clip_id:
+                booking_id = get_booking_id_for_clip(settings, captured_at_utc)
+
+                if booking_id:
+                    try:
+                        update_clip_booking_id(
+                            supabase,
+                            settings,
+                            clip_id=str(clip_id),
+                            booking_id=booking_id,
+                        )
+                        logger.info(
+                            "Clip matched to booking",
+                            extra={
+                                "structured": {
+                                    "clip_id": clip_id,
+                                    "booking_id": booking_id,
+                                    "recorded_at": captured_at_utc,
+                                }
+                            },
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to update clip with booking_id",
+                            extra={
+                                "structured": {
+                                    "clip_id": clip_id,
+                                    "booking_id": booking_id,
+                                    "recorded_at": captured_at_utc,
+                                }
+                            },
+                        )
+                else:
+                    logger.warning(
+                        "UNMATCHED CLIP",
                         extra={
                             "structured": {
                                 "clip_id": clip_id,
-                                "booking_id": booking_id,
                                 "recorded_at": captured_at_utc,
                             }
                         },
                     )
             else:
                 logger.warning(
-                    "UNMATCHED CLIP",
-                    extra={
-                        "structured": {
-                            "clip_id": clip_id,
-                            "recorded_at": captured_at_utc,
-                        }
-                    },
+                    "Clip row has no id; skipping booking lookup",
+                    extra={"structured": {"slug": slug, "recorded_at": captured_at_utc}},
                 )
-        else:
-            logger.warning(
-                "Inserted clip row did not return an id; skipping booking lookup",
+            job_store.update_job(idem, merge_steps=True, step_flags=STEP_BOOKING)
+            flags |= STEP_BOOKING
+
+        if not (flags & STEP_FINALIZED):
+            dest = unique_destination(settings.processed_folder, original_name)
+            if settings.recent_completed_suppress_seconds > 0:
+                mark_clip_recently_completed(clip_path, settings.recent_completed_suppress_seconds)
+            moved_ok = move_if_exists(
+                clip_path,
+                dest,
+                retries=settings.move_retries,
+                delay_seconds=settings.move_retry_delay_seconds,
+                context="processed",
+            )
+
+            logger.info(
+                "Clip processed successfully",
                 extra={
                     "structured": {
+                        "original": str(moved_ok or dest),
+                        "preview": str(preview_path),
                         "slug": slug,
                         "recorded_at": captured_at_utc,
+                        "moved_to_processed": moved_ok is not None,
+                        "idempotency_key": idem,
                     }
                 },
             )
 
-        dest = unique_destination(settings.processed_folder, original_name)
-        if settings.recent_completed_suppress_seconds > 0:
-            mark_clip_recently_completed(clip_path, settings.recent_completed_suppress_seconds)
-        moved_ok = move_if_exists(
-            clip_path,
-            dest,
-            retries=settings.move_retries,
-            delay_seconds=settings.move_retry_delay_seconds,
-            context="processed",
-        )
-
-        logger.info(
-            "Clip processed successfully",
-            extra={
-                "structured": {
-                    "original": str(moved_ok or dest),
-                    "preview": str(preview_path),
-                    "slug": slug,
-                    "recorded_at": captured_at_utc,
-                    "moved_to_processed": moved_ok is not None,
-                }
-            },
-        )
+            job_store.update_job(
+                idem,
+                merge_steps=True,
+                step_flags=STEP_FINALIZED,
+                status="completed",
+                processing_path=str((moved_ok or dest).resolve(strict=False)),
+            )
 
         _clear_recent_failure(original_input_path)
         _clear_recent_failure(clip_path)
@@ -1177,6 +1342,12 @@ def process_clip(
     except Exception:
         _mark_recent_failure(original_input_path)
         _mark_recent_failure(clip_path)
+
+        if idem is not None:
+            job_store.update_job(
+                idem,
+                last_error="processing_exception",
+            )
 
         if pipeline_db_persisted or pipeline_upload_started:
             logger.exception(
@@ -1213,7 +1384,12 @@ def process_clip(
                         delay_seconds=settings.move_retry_delay_seconds,
                         context="failed_generic",
                     )
-                    if moved_fail is not None:
+                    if moved_fail is not None and idem is not None:
+                        job_store.update_job(
+                            idem,
+                            status="failed",
+                            processing_path=str(moved_fail.resolve(strict=False)),
+                        )
                         logger.info(
                             "Moved failed clip",
                             extra={"structured": {"path": str(moved_fail)}},

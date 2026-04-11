@@ -86,7 +86,9 @@ _SLUG_SAFE = re.compile(r"[^a-z0-9]+")
 class Settings:
     """Runtime configuration for the ReplayTrove clip worker."""
 
-    clips_folder: Path
+    clips_incoming_folder: Path
+    clips_processing_folder: Path
+    job_db_path: Path
     preview_folder: Path
     processed_folder: Path
     failed_folder: Path
@@ -134,6 +136,9 @@ class Settings:
     upload_retries: int
     upload_retry_delay_seconds: float
 
+    s3_multipart_threshold_bytes: int
+    s3_multipart_chunksize_bytes: int
+
     move_retries: int
     move_retry_delay_seconds: float
 
@@ -180,15 +185,28 @@ def load_settings(env_file: Path | None = None) -> Settings:
     else:
         load_dotenv(override=False)
 
-    clips = Path(_optional("WATCH_FOLDER", r"C:\ReplayTrove\clips"))
-    clips_raw = os.environ.get("CLIPS_FOLDER", "").strip()
-    if clips_raw:
-        clips = Path(clips_raw)
+    incoming = Path(_optional("WATCH_FOLDER", r"C:\ReplayTrove\clips"))
+    inc_raw = os.environ.get("CLIPS_INCOMING_FOLDER", "").strip()
+    if inc_raw:
+        incoming = Path(inc_raw)
+    else:
+        clips_raw = os.environ.get("CLIPS_FOLDER", "").strip()
+        if clips_raw:
+            incoming = Path(clips_raw)
+
+    proc_raw = os.environ.get("PROCESSING_CLIPS_FOLDER", "").strip()
+    if proc_raw:
+        processing = Path(proc_raw)
+    else:
+        processing = incoming.parent / "clips_processing"
 
     preview = Path(_optional("PREVIEW_FOLDER", r"C:\ReplayTrove\previews"))
     processed = Path(_optional("PROCESSED_FOLDER", r"C:\ReplayTrove\processed"))
     failed = Path(_optional("FAILED_FOLDER", r"C:\ReplayTrove\failed"))
     logs = Path(_optional("LOG_FOLDER", r"C:\ReplayTrove\logs"))
+    job_db = Path(
+        _optional("WORKER_JOB_DB", str(logs / "replaytrove_jobs.sqlite"))
+    )
 
     ffmpeg = Path(_optional("FFMPEG_PATH", r"C:\ffmpeg\bin\ffmpeg.exe"))
 
@@ -251,6 +269,17 @@ def load_settings(env_file: Path | None = None) -> Settings:
         "UPLOAD_RETRY_DELAY_SECONDS",
         _optional("UPLOAD_RETRY_DELAY_SECONDS", "3"),
         minimum=0,
+    )
+
+    mp_thresh = _parse_int(
+        "S3_MULTIPART_THRESHOLD_BYTES",
+        _optional("S3_MULTIPART_THRESHOLD_BYTES", str(32 * 1024 * 1024)),
+        minimum=8 * 1024 * 1024,
+    )
+    mp_chunk = _parse_int(
+        "S3_MULTIPART_CHUNKSIZE_BYTES",
+        _optional("S3_MULTIPART_CHUNKSIZE_BYTES", str(128 * 1024 * 1024)),
+        minimum=8 * 1024 * 1024,
     )
 
     move_retries = _parse_int(
@@ -378,7 +407,9 @@ def load_settings(env_file: Path | None = None) -> Settings:
     )
 
     return Settings(
-        clips_folder=clips,
+        clips_incoming_folder=incoming,
+        clips_processing_folder=processing,
+        job_db_path=job_db,
         preview_folder=preview,
         processed_folder=processed,
         failed_folder=failed,
@@ -414,6 +445,8 @@ def load_settings(env_file: Path | None = None) -> Settings:
         file_stable_min_age_seconds=stable_min_age,
         upload_retries=up_retries,
         upload_retry_delay_seconds=up_delay,
+        s3_multipart_threshold_bytes=mp_thresh,
+        s3_multipart_chunksize_bytes=mp_chunk,
         move_retries=move_retries,
         move_retry_delay_seconds=move_delay,
         recent_failure_cooldown_seconds=recent_failure_cooldown,

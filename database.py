@@ -19,7 +19,28 @@ def create_supabase_client(settings: Settings) -> Client:
     return create_client(settings.supabase_url, settings.supabase_key)
 
 
-def insert_clip_record(
+def _clip_row(
+    settings: Settings,
+    *,
+    title: str,
+    slug: str,
+    s3_key: str,
+    preview_s3_key: str,
+    recorded_at: str,
+) -> dict[str, Any]:
+    return {
+        "title": title,
+        "slug": slug,
+        "s3_key": s3_key,
+        "preview_s3_key": preview_s3_key,
+        "recorded_at": recorded_at,
+        "club_id": settings.club_id,
+        "court_id": settings.court_id,
+        "published": settings.published,
+    }
+
+
+def upsert_clip_record(
     client: Client,
     settings: Settings,
     *,
@@ -30,24 +51,19 @@ def insert_clip_record(
     recorded_at: str,
 ) -> dict[str, Any]:
     """
-    Insert one clip row.
-
-    If a duplicate s3_key exists, return the existing row instead of failing.
+    Insert or update on ``s3_key`` conflict so restarts never create duplicate rows.
     """
-
-    row = {
-        "title": title,
-        "slug": slug,
-        "s3_key": s3_key,
-        "preview_s3_key": preview_s3_key,
-        "recorded_at": recorded_at,
-        "club_id": settings.club_id,
-        "court_id": settings.court_id,
-        "published": True,
-    }
+    row = _clip_row(
+        settings,
+        title=title,
+        slug=slug,
+        s3_key=s3_key,
+        preview_s3_key=preview_s3_key,
+        recorded_at=recorded_at,
+    )
 
     logger.info(
-        "Supabase insert",
+        "Supabase upsert",
         extra={
             "structured": {
                 "table": settings.supabase_clips_table,
@@ -61,41 +77,19 @@ def insert_clip_record(
     try:
         response = (
             client.table(settings.supabase_clips_table)
-            .insert(row)
+            .upsert(row, on_conflict="s3_key")
             .execute()
         )
-
-        logger.info(
-            "Supabase insert completed",
-            extra={
-                "structured": {
-                    "table": settings.supabase_clips_table,
-                    "slug": slug,
-                    "recorded_at": recorded_at,
-                }
-            },
-        )
-
         data = getattr(response, "data", None)
         if data and isinstance(data, list) and len(data) > 0:
             return data[0]
-
         return row
-
     except APIError as e:
-        error_message = str(e)
-
-        # 👇 HANDLE DUPLICATE s3_key CLEANLY
-        if "duplicate key value violates unique constraint" in error_message:
+        if "duplicate key value violates unique constraint" in str(e):
             logger.warning(
-                "Duplicate clip detected, fetching existing record",
-                extra={
-                    "structured": {
-                        "s3_key": s3_key,
-                    }
-                },
+                "Upsert fell back to select",
+                extra={"structured": {"s3_key": s3_key}},
             )
-
             existing = (
                 client.table(settings.supabase_clips_table)
                 .select("*")
@@ -103,16 +97,32 @@ def insert_clip_record(
                 .limit(1)
                 .execute()
             )
-
             data = getattr(existing, "data", None)
             if data and len(data) > 0:
                 return data[0]
-
-            # fallback if somehow not found
-            return row
-
-        # 🚨 REAL ERROR → re-raise
         raise
+
+
+def insert_clip_record(
+    client: Client,
+    settings: Settings,
+    *,
+    title: str,
+    slug: str,
+    s3_key: str,
+    preview_s3_key: str,
+    recorded_at: str,
+) -> dict[str, Any]:
+    """Backward-compatible alias for :func:`upsert_clip_record`."""
+    return upsert_clip_record(
+        client,
+        settings,
+        title=title,
+        slug=slug,
+        s3_key=s3_key,
+        preview_s3_key=preview_s3_key,
+        recorded_at=recorded_at,
+    )
 
 
 def update_clip_booking_id(

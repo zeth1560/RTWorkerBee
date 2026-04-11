@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger(__name__)
@@ -32,13 +33,21 @@ class S3Uploader:
         access_key_id: str,
         secret_access_key: str,
         upload_retries: int,
-        upload_retry_delay_seconds: int,
+        upload_retry_delay_seconds: float,
         label: str = "s3",
+        multipart_threshold_bytes: int = 8 * 1024 * 1024,
+        multipart_chunksize_bytes: int = 128 * 1024 * 1024,
     ) -> None:
         self.bucket = bucket
         self.upload_retries = max(1, upload_retries)
         self.upload_retry_delay_seconds = upload_retry_delay_seconds
         self.label = label
+        self._transfer_config = TransferConfig(
+            multipart_threshold=multipart_threshold_bytes,
+            multipart_chunksize=multipart_chunksize_bytes,
+            max_concurrency=10,
+            use_threads=True,
+        )
 
         self._client = boto3.client(
             "s3",
@@ -74,6 +83,7 @@ class S3Uploader:
                     self.bucket,
                     object_key,
                     ExtraArgs=extra_args or None,
+                    Config=self._transfer_config,
                 )
                 logger.info(
                     "S3 upload completed",

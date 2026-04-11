@@ -112,7 +112,7 @@ class ClipFileHandler(FileSystemEventHandler):
         if not is_video_file(normalized, self._settings):
             return
 
-        if normalized.parent.resolve(strict=False) != self._settings.clips_folder.resolve(
+        if normalized.parent.resolve(strict=False) != self._settings.clips_incoming_folder.resolve(
             strict=False
         ):
             return
@@ -202,11 +202,11 @@ class ClipJobQueue:
 
 
 def scan_existing_clips(settings: Settings, submit: Callable[[Path], None]) -> None:
-    """Enqueue any existing videos in the clips folder on startup."""
-    if not settings.clips_folder.is_dir():
+    """Enqueue any existing videos in the incoming clips folder on startup."""
+    if not settings.clips_incoming_folder.is_dir():
         return
 
-    for entry in sorted(settings.clips_folder.iterdir()):
+    for entry in sorted(settings.clips_incoming_folder.iterdir()):
         if not entry.is_file():
             continue
         if is_copying_temp_clip(entry, settings):
@@ -222,13 +222,33 @@ def scan_existing_clips(settings: Settings, submit: Callable[[Path], None]) -> N
             submit(resolved)
 
 
+def scan_processing_resume(settings: Settings, submit: Callable[[Path], None]) -> None:
+    """Resume incomplete jobs: enqueue videos still under ``clips_processing_folder``."""
+    proc = settings.clips_processing_folder
+    if not proc.is_dir():
+        return
+    for entry in sorted(proc.iterdir()):
+        if not entry.is_file():
+            continue
+        if is_copying_temp_clip(entry, settings):
+            continue
+        resolved = entry.resolve(strict=False)
+        if clip_path_inflight(resolved):
+            continue
+        if should_ignore_file(entry, settings):
+            continue
+        if is_video_file(entry, settings):
+            submit(resolved)
+
+
 def start_observer(settings: Settings, event_handler: FileSystemEventHandler) -> Observer:
-    settings.clips_folder.mkdir(parents=True, exist_ok=True)
+    settings.clips_incoming_folder.mkdir(parents=True, exist_ok=True)
+    settings.clips_processing_folder.mkdir(parents=True, exist_ok=True)
     observer = Observer()
-    observer.schedule(event_handler, str(settings.clips_folder), recursive=False)
+    observer.schedule(event_handler, str(settings.clips_incoming_folder), recursive=False)
     observer.start()
     logger.info(
         "Watchdog observer started",
-        extra={"structured": {"path": str(settings.clips_folder)}},
+        extra={"structured": {"path": str(settings.clips_incoming_folder)}},
     )
     return observer
