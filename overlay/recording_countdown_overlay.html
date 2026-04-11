@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Recording countdown</title>
+  <style>
+    :root {
+      --panel-bg: rgba(0, 0, 0, 0.92);
+      --text: #f5f5f5;
+      --accent: #e53935;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: transparent;
+    }
+    #root {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 24px;
+      pointer-events: none;
+    }
+    #root.interactive {
+      pointer-events: auto;
+    }
+    .panel {
+      display: none;
+      min-width: 320px;
+      max-width: min(90vw, 520px);
+      padding: 20px 24px;
+      background: var(--panel-bg);
+      border: 2px solid #333;
+      border-radius: 12px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55);
+      color: var(--text);
+      text-align: center;
+    }
+    .panel.visible { display: block; }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      margin-bottom: 12px;
+    }
+    .rec-light {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #4a0000;
+      box-shadow: inset 0 0 6px rgba(0, 0, 0, 0.8);
+      flex-shrink: 0;
+    }
+    .rec-light.on {
+      background: var(--accent);
+      box-shadow: 0 0 12px var(--accent), 0 0 4px #ff7961;
+      animation: blink 1s step-end infinite;
+    }
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.2; }
+    }
+    .timer {
+      font-size: 2.25rem;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.06em;
+      font-weight: 600;
+    }
+    .label {
+      font-size: 0.85rem;
+      opacity: 0.85;
+      margin-top: 4px;
+    }
+    .ended {
+      font-size: 1.05rem;
+      line-height: 1.45;
+      margin: 0;
+    }
+    .hint {
+      margin-top: 14px;
+      font-size: 0.75rem;
+      opacity: 0.55;
+    }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div id="panel" class="panel" aria-live="polite">
+      <div id="countdownBlock">
+        <div class="row">
+          <div id="recLight" class="rec-light" aria-hidden="true"></div>
+          <div id="timer" class="timer">20:00</div>
+        </div>
+        <div class="label">Recording — time remaining</div>
+      </div>
+      <div id="endedBlock" style="display: none;">
+        <p class="ended" id="endedText">
+          Your recording has reached its maximum length and ended
+        </p>
+        <p class="hint" id="dismissHint"></p>
+      </div>
+    </div>
+  </div>
+  <script>
+(function () {
+  const API_BASE = (function () {
+    const p = new URLSearchParams(window.location.search);
+    const u = p.get("api");
+    if (u) return u.replace(/\/$/, "");
+    return window.location.origin;
+  })();
+
+  const POLL_MS = 400;
+  const panel = document.getElementById("panel");
+  const root = document.getElementById("root");
+  const timerEl = document.getElementById("timer");
+  const recLight = document.getElementById("recLight");
+  const countdownBlock = document.getElementById("countdownBlock");
+  const endedBlock = document.getElementById("endedBlock");
+  const dismissHint = document.getElementById("dismissHint");
+
+  let lastPhase = "idle";
+  let localEndsAt = null;
+  let tickTimer = null;
+
+  function formatMmSs(totalSec) {
+    const s = Math.max(0, Math.floor(totalSec));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return String(m).padStart(2, "0") + ":" + String(r).padStart(2, "0");
+  }
+
+  function showIdle() {
+    panel.classList.remove("visible");
+    countdownBlock.style.display = "block";
+    endedBlock.style.display = "none";
+    recLight.classList.remove("on");
+    root.classList.remove("interactive");
+    if (tickTimer) {
+      clearInterval(tickTimer);
+      tickTimer = null;
+    }
+    localEndsAt = null;
+  }
+
+  function showCountdown(remainingSec) {
+    panel.classList.add("visible");
+    countdownBlock.style.display = "block";
+    endedBlock.style.display = "none";
+    recLight.classList.add("on");
+    root.classList.remove("interactive");
+    timerEl.textContent = formatMmSs(remainingSec);
+  }
+
+  function showEnded(dismissKeys) {
+    panel.classList.add("visible");
+    countdownBlock.style.display = "none";
+    endedBlock.style.display = "block";
+    recLight.classList.remove("on");
+    root.classList.add("interactive");
+    if (tickTimer) {
+      clearInterval(tickTimer);
+      tickTimer = null;
+    }
+    const keys = (dismissKeys && dismissKeys.length) ? dismissKeys.join(" / ") : "Dismiss hotkey";
+    dismissHint.textContent =
+      "Press " + keys + " on this source (OBS: right-click browser → Interact) or use the Stream Deck dismiss action.";
+  }
+
+  function startLocalTick() {
+    if (tickTimer) clearInterval(tickTimer);
+    tickTimer = setInterval(function () {
+      if (localEndsAt == null) return;
+      const left = (localEndsAt - Date.now()) / 1000;
+      if (left <= 0) {
+        timerEl.textContent = "00:00";
+        return;
+      }
+      timerEl.textContent = formatMmSs(left);
+    }, 250);
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch(API_BASE + "/api/overlay-state", { cache: "no-store" });
+      if (!r.ok) return;
+      const data = await r.json();
+      const phase = data.phase || "idle";
+
+      if (phase === "countdown") {
+        const rem = typeof data.remaining_sec === "number" ? data.remaining_sec : 0;
+        if (typeof data.ends_at_ms === "number") {
+          localEndsAt = data.ends_at_ms;
+          startLocalTick();
+        }
+        showCountdown(rem);
+      } else if (phase === "ended") {
+        showEnded(data.dismiss_keys || []);
+      } else {
+        showIdle();
+      }
+
+      lastPhase = phase;
+    } catch (_) {
+      /* offline — keep last UI */
+    }
+  }
+
+  setInterval(poll, POLL_MS);
+  poll();
+
+  window.addEventListener("keydown", function (e) {
+    if (lastPhase !== "ended") return;
+    const key = (e.key || "").toLowerCase();
+    fetch(API_BASE + "/api/dismiss-ended", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: key }),
+    }).catch(function () {});
+  });
+})();
+  </script>
+</body>
+</html>
