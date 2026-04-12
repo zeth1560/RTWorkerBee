@@ -1,0 +1,36 @@
+"""
+Stable event codes for worker lifecycle logging (JSON ``extra.event`` + human message).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Mapping
+
+CLIP_CLAIMED = "CLIP_CLAIMED"
+JOB_RESUMED = "JOB_RESUMED"
+JOB_RECOVERY_CREATED = "JOB_RECOVERY_CREATED"
+STEP_SKIPPED_ON_RESUME = "STEP_SKIPPED_ON_RESUME"
+PREVIEW_GENERATED = "PREVIEW_GENERATED"
+ORIGINAL_UPLOAD_COMPLETED = "ORIGINAL_UPLOAD_COMPLETED"
+PREVIEW_UPLOAD_COMPLETED = "PREVIEW_UPLOAD_COMPLETED"
+DB_UPSERT_COMPLETED = "DB_UPSERT_COMPLETED"
+BOOKING_MATCH_UNMATCHED = "BOOKING_MATCH_UNMATCHED"
+BOOKING_MATCH_RETRY_SCHEDULED = "BOOKING_MATCH_RETRY_SCHEDULED"
+JOB_FINALIZED = "JOB_FINALIZED"
+STALE_JOB_DETECTED = "STALE_JOB_DETECTED"
+WORKER_HEALTH_SUMMARY = "WORKER_HEALTH_SUMMARY"
+WORKER_STARTUP_SUMMARY = "WORKER_STARTUP_SUMMARY"
+
+
+def log_worker_event(
+    logger: logging.Logger,
+    level: int,
+    event: str,
+    message: str,
+    structured: Mapping[str, Any] | None = None,
+) -> None:
+    payload: dict[str, Any] = {"event": event}
+    if structured:
+        payload.update(dict(structured))
+    logger.log(level, message, extra={"structured": payload})

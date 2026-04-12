@@ -1,5 +1,9 @@
 """
 S3 uploads via boto3 with retries.
+
+``upload_file`` returns persisted metadata (bucket, key, ETag) for SQLite. Uses boto3's
+transfer manager (multipart when over threshold). A future multipart-resume layer can
+wrap the client while keeping this surface area stable.
 """
 
 from __future__ import annotations
@@ -56,7 +60,10 @@ class S3Uploader:
             aws_secret_access_key=secret_access_key,
         )
 
-    def upload_file(self, local_path: Path, object_key: str) -> None:
+    def upload_file(self, local_path: Path, object_key: str) -> dict[str, Any]:
+        """
+        Upload ``local_path`` to ``object_key``. Returns ``bucket``, ``key``, ``etag`` (may be empty).
+        """
         extra_args: dict[str, Any] = {}
         ctype = _guess_content_type(local_path)
         if ctype:
@@ -85,6 +92,23 @@ class S3Uploader:
                     ExtraArgs=extra_args or None,
                     Config=self._transfer_config,
                 )
+                etag = ""
+                try:
+                    head = self._client.head_object(Bucket=self.bucket, Key=object_key)
+                    raw = head.get("ETag")
+                    if raw:
+                        etag = str(raw).strip('"')
+                except (ClientError, BotoCoreError) as head_exc:
+                    logger.warning(
+                        "S3 head_object after upload failed (ETag unavailable)",
+                        extra={
+                            "structured": {
+                                "bucket": self.bucket,
+                                "key": object_key,
+                                "error": str(head_exc),
+                            }
+                        },
+                    )
                 logger.info(
                     "S3 upload completed",
                     extra={
@@ -94,10 +118,15 @@ class S3Uploader:
                             "key": object_key,
                             "path": str(local_path),
                             "attempt": attempt,
+                            "etag": etag,
                         }
                     },
                 )
-                return
+                return {
+                    "bucket": self.bucket,
+                    "key": object_key,
+                    "etag": etag,
+                }
             except (ClientError, BotoCoreError, OSError) as exc:
                 last_error = exc
                 logger.warning(

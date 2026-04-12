@@ -27,8 +27,9 @@ def _clip_row(
     s3_key: str,
     preview_s3_key: str,
     recorded_at: str,
+    worker_job_identity: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    row: dict[str, Any] = {
         "title": title,
         "slug": slug,
         "s3_key": s3_key,
@@ -38,6 +39,10 @@ def _clip_row(
         "court_id": settings.court_id,
         "published": settings.published,
     }
+    col = settings.supabase_clip_worker_identity_column.strip()
+    if col and worker_job_identity:
+        row[col] = worker_job_identity
+    return row
 
 
 def upsert_clip_record(
@@ -49,6 +54,7 @@ def upsert_clip_record(
     s3_key: str,
     preview_s3_key: str,
     recorded_at: str,
+    worker_job_identity: str | None = None,
 ) -> dict[str, Any]:
     """
     Insert or update on ``s3_key`` conflict so restarts never create duplicate rows.
@@ -60,6 +66,7 @@ def upsert_clip_record(
         s3_key=s3_key,
         preview_s3_key=preview_s3_key,
         recorded_at=recorded_at,
+        worker_job_identity=worker_job_identity,
     )
 
     logger.info(
@@ -70,6 +77,7 @@ def upsert_clip_record(
                 "slug": slug,
                 "s3_key": s3_key,
                 "recorded_at": recorded_at,
+                "worker_job_identity": worker_job_identity,
             }
         },
     )
@@ -112,6 +120,7 @@ def insert_clip_record(
     s3_key: str,
     preview_s3_key: str,
     recorded_at: str,
+    worker_job_identity: str | None = None,
 ) -> dict[str, Any]:
     """Backward-compatible alias for :func:`upsert_clip_record`."""
     return upsert_clip_record(
@@ -122,6 +131,7 @@ def insert_clip_record(
         s3_key=s3_key,
         preview_s3_key=preview_s3_key,
         recorded_at=recorded_at,
+        worker_job_identity=worker_job_identity,
     )
 
 

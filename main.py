@@ -17,7 +17,13 @@ from ingest import (
 )
 from logger import setup_logging
 from job_store import JobStore
-from processor import is_copying_temp_clip, process_clip
+from lifecycle_events import (
+    STALE_JOB_DETECTED,
+    WORKER_HEALTH_SUMMARY,
+    WORKER_STARTUP_SUMMARY,
+    log_worker_event,
+)
+from processor import is_copying_temp_clip, is_video_file, process_clip
 from uploader import S3Uploader
 from watcher import (
     ClipFileHandler,
@@ -74,6 +80,20 @@ def _warm_supabase(settings: Settings) -> None:
 
 def _normalize_path(path: Path) -> Path:
     return path.resolve(strict=False)
+
+
+def _count_clip_videos(folder: Path, settings: Settings) -> int:
+    if not folder.is_dir():
+        return 0
+    n = 0
+    for entry in folder.iterdir():
+        if not entry.is_file():
+            continue
+        if is_copying_temp_clip(entry, settings):
+            continue
+        if is_video_file(entry, settings):
+            n += 1
+    return n
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -154,6 +174,36 @@ def main(argv: list[str] | None = None) -> int:
     job_store = JobStore(settings.job_db_path)
     job_store.init_schema()
 
+    if settings.stale_job_idle_seconds > 0:
+        stale_jobs = job_store.list_stale_processing_jobs(settings.stale_job_idle_seconds)
+        for sj in stale_jobs:
+            log_worker_event(
+                logger,
+                logging.WARNING,
+                STALE_JOB_DETECTED,
+                "Stale processing job detected on startup",
+                {
+                    "job_uuid": sj.job_uuid,
+                    "clip_identity": sj.idempotency_key,
+                    "processing_path": sj.processing_path,
+                    "status": sj.status,
+                    "idle_seconds": settings.stale_job_idle_seconds,
+                    "policy": settings.stale_job_policy,
+                },
+            )
+            if settings.stale_job_policy == "flag":
+                job_store.update_job(
+                    sj.idempotency_key,
+                    status="stale",
+                    last_error="stale_processing_idle",
+                    failure_category="retryable",
+                    failure_reason_code="stale_idle",
+                )
+
+    long_clip_sem: threading.BoundedSemaphore | None = None
+    if settings.long_clip_max_concurrent > 0:
+        long_clip_sem = threading.BoundedSemaphore(settings.long_clip_max_concurrent)
+
     job_queue = ClipJobQueue(settings)
     stop = threading.Event()
 
@@ -175,7 +225,14 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             try:
-                process_clip(path, settings, primary_uploader, supabase, job_store)
+                process_clip(
+                    path,
+                    settings,
+                    primary_uploader,
+                    supabase,
+                    job_store,
+                    long_clip_semaphore=long_clip_sem,
+                )
             except Exception:
                 logger.exception(
                     "Worker failed processing clip",
@@ -189,8 +246,61 @@ def main(argv: list[str] | None = None) -> int:
 
         logger.info("Worker thread exiting")
 
-    worker = threading.Thread(target=worker_loop, name="clip-worker", daemon=True)
-    worker.start()
+    workers: list[threading.Thread] = []
+    for wi in range(settings.worker_concurrency):
+        t = threading.Thread(
+            target=worker_loop,
+            name=f"clip-worker-{wi}",
+            daemon=True,
+        )
+        t.start()
+        workers.append(t)
+
+    booking_thread: threading.Thread | None = None
+    if settings.unmatched_booking_retry_seconds > 0:
+
+        def _booking_retry_poll() -> None:
+            while not stop.is_set():
+                if stop.wait(timeout=settings.unmatched_booking_poll_seconds):
+                    break
+                for pstr in job_store.iter_booking_retry_paths(time.time()):
+                    p = Path(pstr)
+                    if p.is_file():
+                        submit_job(p)
+
+        booking_thread = threading.Thread(
+            target=_booking_retry_poll,
+            name="booking-retry-poll",
+            daemon=True,
+        )
+        booking_thread.start()
+
+    health_thread: threading.Thread | None = None
+    if settings.worker_health_summary_interval_seconds > 0:
+
+        def _health_loop() -> None:
+            while not stop.is_set():
+                if stop.wait(timeout=settings.worker_health_summary_interval_seconds):
+                    break
+                by_status = job_store.count_rows_by_status()
+                stale_n = job_store.count_stale_processing(settings.stale_job_idle_seconds)
+                log_worker_event(
+                    logger,
+                    logging.INFO,
+                    WORKER_HEALTH_SUMMARY,
+                    "Worker health summary",
+                    {
+                        "jobs_by_status": by_status,
+                        "stale_processing_estimate": stale_n,
+                    },
+                )
+
+        health_thread = threading.Thread(
+            target=_health_loop,
+            name="worker-health",
+            daemon=True,
+        )
+        health_thread.start()
 
     ingest_threads: list[threading.Thread] = []
 
@@ -264,6 +374,23 @@ def main(argv: list[str] | None = None) -> int:
     scan_existing_clips(settings, submit_job)
     scan_processing_resume(settings, submit_job)
 
+    incoming_n = _count_clip_videos(settings.clips_incoming_folder, settings)
+    processing_n = _count_clip_videos(settings.clips_processing_folder, settings)
+    by_status = job_store.count_rows_by_status()
+    stale_n = job_store.count_stale_processing(settings.stale_job_idle_seconds)
+    log_worker_event(
+        logger,
+        logging.INFO,
+        WORKER_STARTUP_SUMMARY,
+        "Startup scan and job store summary",
+        {
+            "incoming_clip_files": incoming_n,
+            "processing_clip_files": processing_n,
+            "jobs_by_status": by_status,
+            "stale_processing_jobs": stale_n,
+        },
+    )
+
     def handle_signal(signum: int, _frame: object | None) -> None:
         logger.info(
             "Shutdown signal received",
@@ -296,7 +423,12 @@ def main(argv: list[str] | None = None) -> int:
             logger.exception("Failed stopping observer in final shutdown block")
 
     observer.join(timeout=30)
-    worker.join(timeout=10)
+    for w in workers:
+        w.join(timeout=10)
+    if booking_thread is not None:
+        booking_thread.join(timeout=2)
+    if health_thread is not None:
+        health_thread.join(timeout=2)
     for t in ingest_threads:
         t.join(timeout=5)
 

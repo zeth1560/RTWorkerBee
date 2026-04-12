@@ -172,6 +172,29 @@ class Settings:
     long_clips_trigger_file: Path | None
     long_clips_scan_interval_seconds: float
 
+    clip_fingerprint_chunk_bytes: int
+    clip_fingerprint_include_mtime: bool
+    clip_fingerprint_full_hash_max_bytes: int
+
+    worker_concurrency: int
+    long_clip_bytes_threshold: int
+    long_clip_max_concurrent: int
+
+    large_preview_mode: str
+    large_preview_short_seconds: int
+
+    stale_job_idle_seconds: float
+    stale_job_policy: str
+
+    worker_health_summary_interval_seconds: float
+
+    booking_match_http_attempts: int
+    unmatched_booking_retry_seconds: float
+    unmatched_booking_max_attempts: int
+    unmatched_booking_poll_seconds: float
+
+    supabase_clip_worker_identity_column: str
+
 
 def load_settings(env_file: Path | None = None) -> Settings:
     """
@@ -406,6 +429,83 @@ def load_settings(env_file: Path | None = None) -> Settings:
         minimum=0,
     )
 
+    clip_fp_chunk = _parse_int(
+        "CLIP_FINGERPRINT_CHUNK_BYTES",
+        _optional("CLIP_FINGERPRINT_CHUNK_BYTES", str(1024 * 1024)),
+        minimum=4096,
+    )
+    clip_fp_mtime = _parse_bool(_optional("CLIP_FINGERPRINT_INCLUDE_MTIME", "false"))
+    clip_fp_full_max = _parse_int(
+        "CLIP_FINGERPRINT_FULL_HASH_MAX_BYTES",
+        _optional("CLIP_FINGERPRINT_FULL_HASH_MAX_BYTES", "0"),
+        minimum=0,
+    )
+
+    worker_concurrency = _parse_int(
+        "WORKER_CONCURRENCY",
+        _optional("WORKER_CONCURRENCY", "1"),
+        minimum=1,
+    )
+    long_clip_threshold = _parse_int(
+        "LONG_CLIP_BYTES_THRESHOLD",
+        _optional("LONG_CLIP_BYTES_THRESHOLD", str(1024 * 1024 * 1024)),
+        minimum=1,
+    )
+    long_clip_max_conc = _parse_int(
+        "LONG_CLIP_MAX_CONCURRENT",
+        _optional("LONG_CLIP_MAX_CONCURRENT", "1"),
+        minimum=1,
+    )
+
+    large_preview_mode = _optional("LARGE_PREVIEW_MODE", "full").strip().lower()
+    if large_preview_mode not in ("full", "poster", "short", "defer_after_original"):
+        raise ConfigError(
+            "LARGE_PREVIEW_MODE must be one of: full, poster, short, defer_after_original"
+        )
+    large_preview_short_sec = _parse_int(
+        "LARGE_PREVIEW_SHORT_SECONDS",
+        _optional("LARGE_PREVIEW_SHORT_SECONDS", "15"),
+        minimum=1,
+    )
+
+    stale_idle = _parse_float(
+        "STALE_JOB_IDLE_SECONDS",
+        _optional("STALE_JOB_IDLE_SECONDS", "3600"),
+        minimum=0,
+    )
+    stale_policy = _optional("STALE_JOB_POLICY", "log").strip().lower()
+    if stale_policy not in ("log", "flag"):
+        raise ConfigError("STALE_JOB_POLICY must be log or flag")
+
+    health_iv = _parse_float(
+        "WORKER_HEALTH_SUMMARY_INTERVAL_SECONDS",
+        _optional("WORKER_HEALTH_SUMMARY_INTERVAL_SECONDS", "300"),
+        minimum=0,
+    )
+
+    booking_http_attempts = _parse_int(
+        "BOOKING_MATCH_HTTP_ATTEMPTS",
+        _optional("BOOKING_MATCH_HTTP_ATTEMPTS", "3"),
+        minimum=1,
+    )
+    unmatched_retry_sec = _parse_float(
+        "UNMATCHED_BOOKING_RETRY_SECONDS",
+        _optional("UNMATCHED_BOOKING_RETRY_SECONDS", "0"),
+        minimum=0,
+    )
+    unmatched_max = _parse_int(
+        "UNMATCHED_BOOKING_MAX_ATTEMPTS",
+        _optional("UNMATCHED_BOOKING_MAX_ATTEMPTS", "8"),
+        minimum=1,
+    )
+    unmatched_poll = _parse_float(
+        "UNMATCHED_BOOKING_POLL_SECONDS",
+        _optional("UNMATCHED_BOOKING_POLL_SECONDS", "30"),
+        minimum=5,
+    )
+
+    sb_worker_id_col = _optional("SUPABASE_CLIP_WORKER_IDENTITY_COLUMN", "").strip()
+
     return Settings(
         clips_incoming_folder=incoming,
         clips_processing_folder=processing,
@@ -471,6 +571,22 @@ def load_settings(env_file: Path | None = None) -> Settings:
         instant_replay_trigger_settle_seconds=instant_replay_trigger_settle,
         long_clips_trigger_file=long_clips_trigger_file,
         long_clips_scan_interval_seconds=long_clips_scan_interval,
+        clip_fingerprint_chunk_bytes=clip_fp_chunk,
+        clip_fingerprint_include_mtime=clip_fp_mtime,
+        clip_fingerprint_full_hash_max_bytes=clip_fp_full_max,
+        worker_concurrency=worker_concurrency,
+        long_clip_bytes_threshold=long_clip_threshold,
+        long_clip_max_concurrent=long_clip_max_conc,
+        large_preview_mode=large_preview_mode,
+        large_preview_short_seconds=large_preview_short_sec,
+        stale_job_idle_seconds=stale_idle,
+        stale_job_policy=stale_policy,
+        worker_health_summary_interval_seconds=health_iv,
+        booking_match_http_attempts=booking_http_attempts,
+        unmatched_booking_retry_seconds=unmatched_retry_sec,
+        unmatched_booking_max_attempts=unmatched_max,
+        unmatched_booking_poll_seconds=unmatched_poll,
+        supabase_clip_worker_identity_column=sb_worker_id_col,
     )
 
 
