@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -19,11 +20,17 @@ from zoneinfo import ZoneInfo
 from supabase import Client
 
 from clip_fingerprint import compute_clip_idempotency_key
+from connectivity import ConnectivityMonitor
 from config import Settings, slug_from_stem
 from database import update_clip_booking_id, upsert_clip_record
 from job_store import (
+    ClipJob,
     JobIdempotencyCollisionError,
     JobStore,
+    REMOTE_STEP_BOOKING,
+    REMOTE_STEP_DB_UPSERT,
+    REMOTE_STEP_UPLOAD_ORIGINAL,
+    REMOTE_STEP_UPLOAD_PREVIEW,
     STEP_BOOKING,
     STEP_DB_UPSERT,
     STEP_FINALIZED,
@@ -43,9 +50,11 @@ from lifecycle_events import (
     ORIGINAL_UPLOAD_COMPLETED,
     PREVIEW_GENERATED,
     PREVIEW_UPLOAD_COMPLETED,
+    REMOTE_SYNC_DEFERRED,
     STEP_SKIPPED_ON_RESUME,
     log_worker_event,
 )
+from network_retry import NonRetryableDependencyError, TransientNetworkError
 from paths import normalize_storage_path
 from pickle_planner import get_booking_id_for_clip
 from uploader import S3Uploader
@@ -873,6 +882,51 @@ def _deterministic_slug(stem: str, idempotency_key: str) -> str:
     return f"{base}-{idempotency_key[:12]}"
 
 
+def _connectivity_offline(connectivity: ConnectivityMonitor | None) -> bool:
+    return connectivity is not None and connectivity.state == "OFFLINE"
+
+
+def _defer_remote_sync(
+    *,
+    job_store: JobStore,
+    job: ClipJob,
+    idempotency_key: str,
+    failed_step: str,
+    error_message: str,
+    clip_path: Path,
+) -> None:
+    now = time.time()
+    job_store.update_job(
+        idempotency_key,
+        status="pending_remote_sync",
+        last_error=error_message[:1000],
+        failure_category="network",
+        failure_reason_code="waiting_for_network",
+        current_stage=None,
+    )
+    job_store.upsert_remote_sync_pending(
+        job_uuid=job.job_uuid,
+        idempotency_key=idempotency_key,
+        processing_path=job.processing_path,
+        failed_step=failed_step,
+        last_error=error_message[:1000],
+        next_retry_time=now,
+    )
+    log_worker_event(
+        logger,
+        logging.WARNING,
+        REMOTE_SYNC_DEFERRED,
+        "Remote sync deferred until connectivity is available",
+        {
+            "job_uuid": job.job_uuid,
+            "clip_identity": idempotency_key,
+            "failed_step": failed_step,
+            "processing_path": str(clip_path),
+            "error": error_message[:500],
+        },
+    )
+
+
 def process_clip(
     clip_path: Path,
     settings: Settings,
@@ -880,6 +934,8 @@ def process_clip(
     supabase: Client,
     job_store: JobStore,
     long_clip_semaphore: threading.BoundedSemaphore | None = None,
+    connectivity: ConnectivityMonitor | None = None,
+    on_original_upload_complete: Callable[[], None] | None = None,
 ) -> None:
     incoming = settings.clips_incoming_folder.resolve(strict=False)
     processing = settings.clips_processing_folder.resolve(strict=False)
@@ -949,6 +1005,21 @@ def process_clip(
                     extra={"structured": {"idempotency_key": idem}},
                 )
                 return
+            if job.status == "failed":
+                logger.info(
+                    "Job already marked failed; skipping",
+                    extra={"structured": {"idempotency_key": idem}},
+                )
+                return
+            if job.status == "pending_remote_sync":
+                job_store.update_job(
+                    idem,
+                    status="processing",
+                    clear_last_error=True,
+                    clear_failure_metadata=True,
+                )
+                job = job_store.get(idem)
+                assert job is not None
             if job.status == "stale":
                 job_store.update_job(
                     idem,
@@ -1360,8 +1431,34 @@ def process_clip(
                 )
                 job = job_store.get(idem)
                 assert job is not None
+                if _connectivity_offline(connectivity):
+                    _defer_remote_sync(
+                        job_store=job_store,
+                        job=job,
+                        idempotency_key=idem,
+                        failed_step=REMOTE_STEP_UPLOAD_ORIGINAL,
+                        error_message="connectivity_offline",
+                        clip_path=clip_path,
+                    )
+                    return
                 try:
                     up_orig = primary_uploader.upload_file(clip_path, s3_original_key)
+                except TransientNetworkError as exc:
+                    job_store.update_job(
+                        idem,
+                        retry_upload_original=job.retry_upload_original + 1,
+                    )
+                    job = job_store.get(idem)
+                    assert job is not None
+                    _defer_remote_sync(
+                        job_store=job_store,
+                        job=job,
+                        idempotency_key=idem,
+                        failed_step=REMOTE_STEP_UPLOAD_ORIGINAL,
+                        error_message=str(exc),
+                        clip_path=clip_path,
+                    )
+                    return
                 except Exception:
                     job_store.update_job(
                         idem,
@@ -1395,6 +1492,14 @@ def process_clip(
                         "clip_identity": idem,
                     },
                 )
+                if on_original_upload_complete is not None:
+                    try:
+                        on_original_upload_complete()
+                    except Exception:
+                        logger.exception(
+                            "on_original_upload_complete callback failed",
+                            extra={"structured": {"path": str(clip_path)}},
+                        )
             else:
                 log_worker_event(
                     logger,
@@ -1476,8 +1581,34 @@ def process_clip(
                 )
                 job = job_store.get(idem)
                 assert job is not None
+                if _connectivity_offline(connectivity):
+                    _defer_remote_sync(
+                        job_store=job_store,
+                        job=job,
+                        idempotency_key=idem,
+                        failed_step=REMOTE_STEP_UPLOAD_PREVIEW,
+                        error_message="connectivity_offline",
+                        clip_path=clip_path,
+                    )
+                    return
                 try:
                     up_prev = primary_uploader.upload_file(preview_path, s3_preview_key)
+                except TransientNetworkError as exc:
+                    job_store.update_job(
+                        idem,
+                        retry_upload_preview=job.retry_upload_preview + 1,
+                    )
+                    job = job_store.get(idem)
+                    assert job is not None
+                    _defer_remote_sync(
+                        job_store=job_store,
+                        job=job,
+                        idempotency_key=idem,
+                        failed_step=REMOTE_STEP_UPLOAD_PREVIEW,
+                        error_message=str(exc),
+                        clip_path=clip_path,
+                    )
+                    return
                 except Exception:
                     job_store.update_job(
                         idem,
@@ -1534,6 +1665,16 @@ def process_clip(
                 )
                 job = job_store.get(idem)
                 assert job is not None
+                if _connectivity_offline(connectivity):
+                    _defer_remote_sync(
+                        job_store=job_store,
+                        job=job,
+                        idempotency_key=idem,
+                        failed_step=REMOTE_STEP_DB_UPSERT,
+                        error_message="connectivity_offline",
+                        clip_path=clip_path,
+                    )
+                    return
                 try:
                     inserted_clip = upsert_clip_record(
                         supabase,
@@ -1545,6 +1686,22 @@ def process_clip(
                         recorded_at=captured_at_utc,
                         worker_job_identity=job.job_uuid,
                     )
+                except TransientNetworkError as exc:
+                    job_store.update_job(
+                        idem,
+                        retry_db_upsert=job.retry_db_upsert + 1,
+                    )
+                    job = job_store.get(idem)
+                    assert job is not None
+                    _defer_remote_sync(
+                        job_store=job_store,
+                        job=job,
+                        idempotency_key=idem,
+                        failed_step=REMOTE_STEP_DB_UPSERT,
+                        error_message=str(exc),
+                        clip_path=clip_path,
+                    )
+                    return
                 except Exception:
                     job_store.update_job(
                         idem,
@@ -1601,7 +1758,31 @@ def process_clip(
                 assert job is not None
                 prev_attempts = job.booking_match_attempts
                 if clip_id:
-                    booking_id = get_booking_id_for_clip(settings, captured_at_utc)
+                    if _connectivity_offline(connectivity):
+                        _defer_remote_sync(
+                            job_store=job_store,
+                            job=job,
+                            idempotency_key=idem,
+                            failed_step=REMOTE_STEP_BOOKING,
+                            error_message="connectivity_offline",
+                            clip_path=clip_path,
+                        )
+                        return
+                    try:
+                        booking_id = get_booking_id_for_clip(settings, captured_at_utc)
+                    except TransientNetworkError as exc:
+                        job_store.update_job(idem, retry_booking=job.retry_booking + 1)
+                        job = job_store.get(idem)
+                        assert job is not None
+                        _defer_remote_sync(
+                            job_store=job_store,
+                            job=job,
+                            idempotency_key=idem,
+                            failed_step=REMOTE_STEP_BOOKING,
+                            error_message=str(exc),
+                            clip_path=clip_path,
+                        )
+                        return
                     if booking_id:
                         try:
                             update_clip_booking_id(
@@ -1620,6 +1801,18 @@ def process_clip(
                                     }
                                 },
                             )
+                        except TransientNetworkError as exc:
+                            job = job_store.get(idem)
+                            assert job is not None
+                            _defer_remote_sync(
+                                job_store=job_store,
+                                job=job,
+                                idempotency_key=idem,
+                                failed_step=REMOTE_STEP_BOOKING,
+                                error_message=str(exc),
+                                clip_path=clip_path,
+                            )
+                            return
                         except Exception:
                             logger.exception(
                                 "Failed to update clip with booking_id",
@@ -1760,6 +1953,8 @@ def process_clip(
                     current_stage=None,
                 )
                 job = job_store.get(idem)
+                if job is not None:
+                    job_store.delete_remote_sync(job.job_uuid)
                 log_worker_event(
                     logger,
                     logging.INFO,
@@ -1798,6 +1993,21 @@ def process_clip(
         logger.info(
             "Processing aborted: expected file missing",
             extra={"structured": {"path": str(clip_path)}},
+        )
+        return
+    except NonRetryableDependencyError as exc:
+        _mark_recent_failure(original_input_path)
+        _mark_recent_failure(clip_path)
+        if idem is not None:
+            job_store.update_job(
+                idem,
+                last_error=str(exc)[:1000],
+                failure_category="terminal",
+                failure_reason_code="dependency_auth",
+            )
+        logger.error(
+            "Non-retryable dependency error during clip processing",
+            extra={"structured": {"path": str(clip_path), "error": str(exc)[:500]}},
         )
         return
     except Exception:

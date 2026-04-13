@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
 import signal
 import sys
 import threading
@@ -9,6 +10,7 @@ import time
 from pathlib import Path
 
 from config import ConfigError, Settings, load_settings
+from connectivity import ConnectivityMonitor
 from database import create_supabase_client
 from ingest import (
     instant_replay_ingest_loop,
@@ -18,13 +20,17 @@ from ingest import (
 from logger import setup_logging
 from job_store import JobStore
 from lifecycle_events import (
+    REMOTE_SYNC_ABORTED,
+    REMOTE_SYNC_RESUMED,
     STALE_JOB_DETECTED,
     WORKER_HEALTH_SUMMARY,
     WORKER_STARTUP_SUMMARY,
     log_worker_event,
 )
+from network_retry import backoff_delay_seconds
 from processor import is_copying_temp_clip, is_video_file, process_clip
 from uploader import S3Uploader
+from worker_status import WorkerStatusReporter
 from watcher import (
     ClipFileHandler,
     ClipJobQueue,
@@ -151,11 +157,21 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
 
+    connectivity = ConnectivityMonitor(
+        settings,
+        interval_seconds=settings.connectivity_check_interval_seconds,
+        probe_timeout_seconds=settings.connectivity_probe_timeout_seconds,
+    )
+
     try:
         _warm_supabase(settings)
-    except Exception:
-        logger.exception("Supabase connectivity check failed")
-        return 3
+    except Exception as exc:
+        logger.warning(
+            "Supabase warm-up failed (worker continues): %s",
+            exc,
+            extra={"structured": {"error_class": type(exc).__name__}},
+        )
+        connectivity.mark_startup_offline_mode()
 
     supabase = create_supabase_client(settings)
 
@@ -169,10 +185,15 @@ def main(argv: list[str] | None = None) -> int:
         label="primary",
         multipart_threshold_bytes=settings.s3_multipart_threshold_bytes,
         multipart_chunksize_bytes=settings.s3_multipart_chunksize_bytes,
+        network_retry_base_seconds=settings.network_retry_base_seconds,
+        network_retry_max_seconds=settings.network_retry_max_seconds,
+        network_retry_jitter_fraction=settings.network_retry_jitter_fraction,
     )
 
     job_store = JobStore(settings.job_db_path)
     job_store.init_schema()
+
+    status_reporter = WorkerStatusReporter(settings.worker_status_json_path)
 
     if settings.stale_job_idle_seconds > 0:
         stale_jobs = job_store.list_stale_processing_jobs(settings.stale_job_idle_seconds)
@@ -207,6 +228,13 @@ def main(argv: list[str] | None = None) -> int:
     job_queue = ClipJobQueue(settings)
     stop = threading.Event()
 
+    connectivity_thread = threading.Thread(
+        target=lambda: connectivity.run_loop(stop),
+        name="connectivity-monitor",
+        daemon=True,
+    )
+    connectivity_thread.start()
+
     def submit_job(path: Path) -> None:
         normalized = _normalize_path(path)
         if is_copying_temp_clip(normalized, settings):
@@ -232,6 +260,8 @@ def main(argv: list[str] | None = None) -> int:
                     supabase,
                     job_store,
                     long_clip_semaphore=long_clip_sem,
+                    connectivity=connectivity,
+                    on_original_upload_complete=status_reporter.record_original_upload_success,
                 )
             except Exception:
                 logger.exception(
@@ -275,6 +305,135 @@ def main(argv: list[str] | None = None) -> int:
         )
         booking_thread.start()
 
+    remote_sync_thread: threading.Thread | None = None
+
+    def _remote_sync_drain_loop() -> None:
+        def _between_drain_jobs() -> None:
+            base = settings.remote_sync_inter_job_delay_seconds
+            jit = settings.remote_sync_inter_job_jitter_seconds
+            if base <= 0 and jit <= 0:
+                return
+            low = max(0.0, base - jit)
+            high = max(low, base + jit)
+            time.sleep(random.uniform(low, high))
+
+        upload_cb = status_reporter.record_original_upload_success
+        while not stop.is_set():
+            if stop.wait(timeout=settings.remote_sync_drain_interval_seconds):
+                break
+            if connectivity.state == "OFFLINE":
+                continue
+            pending_n = job_store.count_remote_sync_pending()
+            if pending_n == 0:
+                continue
+            due = job_store.list_due_remote_sync(
+                time.time(),
+                limit=settings.remote_sync_max_jobs_per_cycle,
+            )
+            for idx, ent in enumerate(due):
+                if stop.is_set():
+                    break
+                path = Path(ent.processing_path)
+                if not path.is_file():
+                    continue
+                now_ts = time.time()
+                ok, abort_reason, idem_key = job_store.try_begin_remote_sync_drain(
+                    ent.job_uuid,
+                    now=now_ts,
+                    max_total_attempts=settings.remote_sync_max_total_attempts,
+                    max_age_seconds=settings.remote_sync_max_age_seconds,
+                )
+                if not ok:
+                    if abort_reason in ("max_age", "max_attempts"):
+                        log_worker_event(
+                            logger,
+                            logging.WARNING,
+                            REMOTE_SYNC_ABORTED,
+                            "Remote sync abandoned after retry limits",
+                            {
+                                "reason": abort_reason,
+                                "job_uuid": ent.job_uuid,
+                                "clip_identity": idem_key,
+                                "max_total_attempts": settings.remote_sync_max_total_attempts,
+                                "max_age_seconds": settings.remote_sync_max_age_seconds,
+                            },
+                        )
+                    continue
+                log_worker_event(
+                    logger,
+                    logging.INFO,
+                    REMOTE_SYNC_RESUMED,
+                    "Retrying deferred remote sync from queue",
+                    {
+                        "job_uuid": ent.job_uuid,
+                        "failed_step": ent.failed_step,
+                        "path": str(path),
+                        "pending_remote_sync_jobs": pending_n,
+                        "jobs_this_cycle": len(due),
+                        "max_jobs_per_cycle": settings.remote_sync_max_jobs_per_cycle,
+                    },
+                )
+                try:
+                    process_clip(
+                        path,
+                        settings,
+                        primary_uploader,
+                        supabase,
+                        job_store,
+                        long_clip_semaphore=long_clip_sem,
+                        connectivity=connectivity,
+                        on_original_upload_complete=upload_cb,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Remote sync drain pass failed for clip",
+                        extra={"structured": {"path": str(path)}},
+                    )
+                    raw = backoff_delay_seconds(
+                        ent.retry_count,
+                        base_seconds=settings.network_retry_base_seconds,
+                        max_seconds=settings.network_retry_max_seconds,
+                    )
+                    jf = settings.network_retry_jitter_fraction
+                    jittered = raw * (
+                        1.0 + random.uniform(-jf, jf) if jf > 0 else 1.0
+                    )
+                    job_store.bump_remote_sync_retry(
+                        ent.job_uuid,
+                        last_error=str(exc)[:1000],
+                        next_retry_time=time.time() + max(1.0, jittered),
+                    )
+                if idx + 1 < len(due) and not stop.is_set():
+                    _between_drain_jobs()
+
+    remote_sync_thread = threading.Thread(
+        target=_remote_sync_drain_loop,
+        name="remote-sync-drain",
+        daemon=True,
+    )
+    remote_sync_thread.start()
+
+    status_thread: threading.Thread | None = None
+    if settings.worker_status_write_interval_seconds > 0:
+
+        def _status_json_loop() -> None:
+            while not stop.is_set():
+                if stop.wait(timeout=settings.worker_status_write_interval_seconds):
+                    break
+                status_reporter.write(
+                    settings=settings,
+                    connectivity=connectivity,
+                    job_store=job_store,
+                    worker_running=True,
+                )
+
+        status_thread = threading.Thread(
+            target=_status_json_loop,
+            name="worker-status-json",
+            daemon=True,
+        )
+        status_thread.start()
+
     health_thread: threading.Thread | None = None
     if settings.worker_health_summary_interval_seconds > 0:
 
@@ -284,6 +443,7 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 by_status = job_store.count_rows_by_status()
                 stale_n = job_store.count_stale_processing(settings.stale_job_idle_seconds)
+                failed_n = by_status.get("failed", 0)
                 log_worker_event(
                     logger,
                     logging.INFO,
@@ -292,6 +452,10 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         "jobs_by_status": by_status,
                         "stale_processing_estimate": stale_n,
+                        "network_state": connectivity.state,
+                        "pending_remote_sync_queue": job_store.count_remote_sync_pending(),
+                        "failed_jobs": failed_n,
+                        "worker_running": True,
                     },
                 )
 
@@ -388,7 +552,17 @@ def main(argv: list[str] | None = None) -> int:
             "processing_clip_files": processing_n,
             "jobs_by_status": by_status,
             "stale_processing_jobs": stale_n,
+            "network_state": connectivity.state,
+            "pending_remote_sync_queue": job_store.count_remote_sync_pending(),
+            "failed_jobs": by_status.get("failed", 0),
+            "worker_running": True,
         },
+    )
+    status_reporter.write(
+        settings=settings,
+        connectivity=connectivity,
+        job_store=job_store,
+        worker_running=True,
     )
 
     def handle_signal(signum: int, _frame: object | None) -> None:
@@ -421,6 +595,15 @@ def main(argv: list[str] | None = None) -> int:
             observer.stop()
         except Exception:
             logger.exception("Failed stopping observer in final shutdown block")
+        try:
+            status_reporter.write(
+                settings=settings,
+                connectivity=connectivity,
+                job_store=job_store,
+                worker_running=False,
+            )
+        except Exception:
+            logger.exception("Failed final worker status JSON write")
 
     observer.join(timeout=30)
     for w in workers:
@@ -429,6 +612,11 @@ def main(argv: list[str] | None = None) -> int:
         booking_thread.join(timeout=2)
     if health_thread is not None:
         health_thread.join(timeout=2)
+    if remote_sync_thread is not None:
+        remote_sync_thread.join(timeout=2)
+    if status_thread is not None:
+        status_thread.join(timeout=2)
+    connectivity_thread.join(timeout=2)
     for t in ingest_threads:
         t.join(timeout=5)
 

@@ -11,6 +11,11 @@ from supabase import Client, create_client
 from postgrest.exceptions import APIError
 
 from config import Settings
+from network_retry import (
+    call_with_network_retry,
+    is_retryable_network_error,
+    logging_retry_hook,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,33 +87,46 @@ def upsert_clip_record(
         },
     )
 
-    try:
-        response = (
-            client.table(settings.supabase_clips_table)
-            .upsert(row, on_conflict="s3_key")
-            .execute()
-        )
-        data = getattr(response, "data", None)
-        if data and isinstance(data, list) and len(data) > 0:
-            return data[0]
-        return row
-    except APIError as e:
-        if "duplicate key value violates unique constraint" in str(e):
-            logger.warning(
-                "Upsert fell back to select",
-                extra={"structured": {"s3_key": s3_key}},
-            )
-            existing = (
+    def _execute_upsert() -> dict[str, Any]:
+        try:
+            response = (
                 client.table(settings.supabase_clips_table)
-                .select("*")
-                .eq("s3_key", s3_key)
-                .limit(1)
+                .upsert(row, on_conflict="s3_key")
                 .execute()
             )
-            data = getattr(existing, "data", None)
-            if data and len(data) > 0:
+            data = getattr(response, "data", None)
+            if data and isinstance(data, list) and len(data) > 0:
                 return data[0]
-        raise
+            return row
+        except APIError as e:
+            if "duplicate key value violates unique constraint" in str(e):
+                logger.warning(
+                    "Upsert fell back to select",
+                    extra={"structured": {"s3_key": s3_key}},
+                )
+                existing = (
+                    client.table(settings.supabase_clips_table)
+                    .select("*")
+                    .eq("s3_key", s3_key)
+                    .limit(1)
+                    .execute()
+                )
+                data = getattr(existing, "data", None)
+                if data and len(data) > 0:
+                    return data[0]
+            if is_retryable_network_error(e):
+                raise
+            raise
+
+    return call_with_network_retry(
+        _execute_upsert,
+        operation="supabase_upsert",
+        base_seconds=settings.network_retry_base_seconds,
+        max_seconds=settings.network_retry_max_seconds,
+        jitter_frac=settings.network_retry_jitter_fraction,
+        max_rounds=settings.network_retry_rounds_per_tick,
+        on_retry=logging_retry_hook("Supabase upsert"),
+    )
 
 
 def insert_clip_record(
@@ -158,11 +176,26 @@ def update_clip_booking_id(
         },
     )
 
-    response = (
-        client.table(settings.supabase_clips_table)
-        .update({"booking_id": booking_id})
-        .eq("id", clip_id)
-        .execute()
+    def _do_update() -> dict[str, Any]:
+        response = (
+            client.table(settings.supabase_clips_table)
+            .update({"booking_id": booking_id})
+            .eq("id", clip_id)
+            .execute()
+        )
+        data = getattr(response, "data", None)
+        if data and isinstance(data, list) and len(data) > 0:
+            return data[0]
+        return {"id": clip_id, "booking_id": booking_id}
+
+    out = call_with_network_retry(
+        _do_update,
+        operation="supabase_booking_update",
+        base_seconds=settings.network_retry_base_seconds,
+        max_seconds=settings.network_retry_max_seconds,
+        jitter_frac=settings.network_retry_jitter_fraction,
+        max_rounds=settings.network_retry_rounds_per_tick,
+        on_retry=logging_retry_hook("Supabase booking update"),
     )
 
     logger.info(
@@ -175,9 +208,4 @@ def update_clip_booking_id(
             }
         },
     )
-
-    data = getattr(response, "data", None)
-    if data and isinstance(data, list) and len(data) > 0:
-        return data[0]
-
-    return {"id": clip_id, "booking_id": booking_id}
+    return out

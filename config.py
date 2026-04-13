@@ -195,6 +195,21 @@ class Settings:
 
     supabase_clip_worker_identity_column: str
 
+    network_retry_base_seconds: float
+    network_retry_max_seconds: float
+    network_retry_jitter_fraction: float
+    network_retry_rounds_per_tick: int
+    connectivity_check_interval_seconds: float
+    connectivity_probe_timeout_seconds: float
+    remote_sync_drain_interval_seconds: float
+    remote_sync_max_jobs_per_cycle: int
+    remote_sync_inter_job_delay_seconds: float
+    remote_sync_inter_job_jitter_seconds: float
+    remote_sync_max_total_attempts: int
+    remote_sync_max_age_seconds: float
+    worker_status_json_path: Path
+    worker_status_write_interval_seconds: float
+
 
 def load_settings(env_file: Path | None = None) -> Settings:
     """
@@ -506,6 +521,75 @@ def load_settings(env_file: Path | None = None) -> Settings:
 
     sb_worker_id_col = _optional("SUPABASE_CLIP_WORKER_IDENTITY_COLUMN", "").strip()
 
+    net_retry_base = _parse_float(
+        "NETWORK_RETRY_BASE_SECONDS",
+        _optional("NETWORK_RETRY_BASE_SECONDS", "5"),
+        minimum=0.5,
+    )
+    net_retry_max = _parse_float(
+        "NETWORK_RETRY_MAX_SECONDS",
+        _optional("NETWORK_RETRY_MAX_SECONDS", "60"),
+        minimum=net_retry_base,
+    )
+    net_retry_jitter = _parse_float(
+        "NETWORK_RETRY_JITTER_FRACTION",
+        _optional("NETWORK_RETRY_JITTER_FRACTION", "0.2"),
+        minimum=0.0,
+    )
+    net_retry_rounds = _parse_int(
+        "NETWORK_RETRY_ROUNDS_PER_TICK",
+        _optional("NETWORK_RETRY_ROUNDS_PER_TICK", "6"),
+        minimum=1,
+    )
+    conn_interval = _parse_float(
+        "CONNECTIVITY_CHECK_INTERVAL_SECONDS",
+        _optional("CONNECTIVITY_CHECK_INTERVAL_SECONDS", "30"),
+        minimum=5.0,
+    )
+    conn_probe_timeout = _parse_float(
+        "CONNECTIVITY_PROBE_TIMEOUT_SECONDS",
+        _optional("CONNECTIVITY_PROBE_TIMEOUT_SECONDS", "5"),
+        minimum=1.0,
+    )
+    remote_drain_iv = _parse_float(
+        "REMOTE_SYNC_DRAIN_INTERVAL_SECONDS",
+        _optional("REMOTE_SYNC_DRAIN_INTERVAL_SECONDS", "8"),
+        minimum=1.0,
+    )
+    remote_sync_max_per_cycle = _parse_int(
+        "REMOTE_SYNC_MAX_JOBS_PER_CYCLE",
+        _optional("REMOTE_SYNC_MAX_JOBS_PER_CYCLE", "3"),
+        minimum=1,
+    )
+    remote_inter_delay = _parse_float(
+        "REMOTE_SYNC_INTER_JOB_DELAY_SECONDS",
+        _optional("REMOTE_SYNC_INTER_JOB_DELAY_SECONDS", "0.35"),
+        minimum=0.0,
+    )
+    remote_inter_jitter = _parse_float(
+        "REMOTE_SYNC_INTER_JOB_JITTER_SECONDS",
+        _optional("REMOTE_SYNC_INTER_JOB_JITTER_SECONDS", "0.15"),
+        minimum=0.0,
+    )
+    remote_sync_max_attempts = _parse_int(
+        "REMOTE_SYNC_MAX_TOTAL_ATTEMPTS",
+        _optional("REMOTE_SYNC_MAX_TOTAL_ATTEMPTS", "20"),
+        minimum=0,
+    )
+    remote_sync_max_age = _parse_float(
+        "REMOTE_SYNC_MAX_AGE_SECONDS",
+        _optional("REMOTE_SYNC_MAX_AGE_SECONDS", str(24 * 3600)),
+        minimum=0.0,
+    )
+    status_json = Path(
+        _optional("WORKER_STATUS_JSON_PATH", r"C:\ReplayTrove\status.json")
+    )
+    status_write_iv = _parse_float(
+        "WORKER_STATUS_WRITE_INTERVAL_SECONDS",
+        _optional("WORKER_STATUS_WRITE_INTERVAL_SECONDS", "5"),
+        minimum=0.0,
+    )
+
     return Settings(
         clips_incoming_folder=incoming,
         clips_processing_folder=processing,
@@ -587,6 +671,20 @@ def load_settings(env_file: Path | None = None) -> Settings:
         unmatched_booking_max_attempts=unmatched_max,
         unmatched_booking_poll_seconds=unmatched_poll,
         supabase_clip_worker_identity_column=sb_worker_id_col,
+        network_retry_base_seconds=net_retry_base,
+        network_retry_max_seconds=net_retry_max,
+        network_retry_jitter_fraction=net_retry_jitter,
+        network_retry_rounds_per_tick=net_retry_rounds,
+        connectivity_check_interval_seconds=conn_interval,
+        connectivity_probe_timeout_seconds=conn_probe_timeout,
+        remote_sync_drain_interval_seconds=remote_drain_iv,
+        remote_sync_max_jobs_per_cycle=remote_sync_max_per_cycle,
+        remote_sync_inter_job_delay_seconds=remote_inter_delay,
+        remote_sync_inter_job_jitter_seconds=remote_inter_jitter,
+        remote_sync_max_total_attempts=remote_sync_max_attempts,
+        remote_sync_max_age_seconds=remote_sync_max_age,
+        worker_status_json_path=status_json,
+        worker_status_write_interval_seconds=status_write_iv,
     )
 
 

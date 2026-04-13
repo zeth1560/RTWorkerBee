@@ -31,6 +31,13 @@ STEP_UPLOAD_PREVIEW = 1 << 3
 STEP_DB_UPSERT = 1 << 4
 STEP_BOOKING = 1 << 5
 STEP_FINALIZED = 1 << 6
+STEP_DETECTED = 1 << 7
+STEP_MOVED_TO_PROCESSING = 1 << 8
+
+REMOTE_STEP_UPLOAD_ORIGINAL = "upload_original"
+REMOTE_STEP_UPLOAD_PREVIEW = "upload_preview"
+REMOTE_STEP_DB_UPSERT = "db_upsert"
+REMOTE_STEP_BOOKING = "booking_match"
 
 
 @dataclass
@@ -118,6 +125,34 @@ CREATE INDEX IF NOT EXISTS idx_clip_jobs_processing_path ON clip_jobs(processing
 CREATE INDEX IF NOT EXISTS idx_clip_jobs_status ON clip_jobs(status);
 """
 
+_REMOTE_SYNC_SCHEMA = """
+CREATE TABLE IF NOT EXISTS remote_sync_queue (
+    job_uuid TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL,
+    processing_path TEXT NOT NULL,
+    failed_step TEXT NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    next_retry_time REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_remote_sync_next ON remote_sync_queue(next_retry_time);
+"""
+
+
+def _migrate_remote_sync_queue(conn: sqlite3.Connection) -> None:
+    conn.executescript(_REMOTE_SYNC_SCHEMA)
+    try:
+        rows = conn.execute("PRAGMA table_info(remote_sync_queue)").fetchall()
+    except sqlite3.OperationalError:
+        return
+    existing = {str(r[1]) for r in rows}
+    if "drain_attempts" not in existing:
+        conn.execute(
+            "ALTER TABLE remote_sync_queue ADD COLUMN drain_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+
 
 _MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("job_uuid", "TEXT"),
@@ -184,6 +219,30 @@ def _migrate_clip_jobs(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_clip_jobs_job_uuid ON clip_jobs(job_uuid)"
         )
 
+    _migrate_remote_sync_queue(conn)
+    conn.execute(
+        f"""
+        UPDATE clip_jobs
+        SET step_flags = step_flags | {STEP_DETECTED | STEP_MOVED_TO_PROCESSING}
+        WHERE status IN ('processing', 'pending_remote_sync', 'completed', 'failed', 'stale')
+          AND (step_flags & {STEP_MOVED_TO_PROCESSING}) = 0
+        """
+    )
+
+
+@dataclass
+class RemoteSyncEntry:
+    job_uuid: str
+    idempotency_key: str
+    processing_path: str
+    failed_step: str
+    retry_count: int
+    drain_attempts: int
+    last_error: str | None
+    next_retry_time: float
+    created_at: float
+    updated_at: float
+
 
 class JobStore:
     def __init__(self, db_path: Path) -> None:
@@ -198,12 +257,26 @@ class JobStore:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.commit()
 
+    def _normalize_step_flags(self, flags: int, status: str) -> int:
+        sf = int(flags)
+        if status in (
+            "processing",
+            "pending_remote_sync",
+            "completed",
+            "failed",
+            "stale",
+        ):
+            if not (sf & STEP_MOVED_TO_PROCESSING):
+                sf |= STEP_DETECTED | STEP_MOVED_TO_PROCESSING
+        return sf
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         return conn
 
     def _row_to_job(self, row: sqlite3.Row) -> ClipJob:
+        flags = self._normalize_step_flags(int(row["step_flags"]), str(row["status"]))
         return ClipJob(
             idempotency_key=row["idempotency_key"],
             job_uuid=row["job_uuid"] or str(uuid.uuid4()),
@@ -212,7 +285,7 @@ class JobStore:
             incoming_path=row["incoming_path"],
             processing_path=row["processing_path"],
             file_size=int(row["file_size"]),
-            step_flags=int(row["step_flags"]),
+            step_flags=flags,
             utc_filename=row["utc_filename"],
             preview_relpath=row["preview_relpath"],
             s3_original_key=row["s3_original_key"],
@@ -291,12 +364,13 @@ class JobStore:
         with self._lock:
             with self._connect() as conn:
                 try:
+                    initial_flags = STEP_DETECTED | STEP_MOVED_TO_PROCESSING
                     conn.execute(
                         """
                         INSERT INTO clip_jobs (
                             idempotency_key, job_uuid, status, incoming_basename, incoming_path,
                             processing_path, file_size, step_flags, created_at, updated_at
-                        ) VALUES (?, ?, 'processing', ?, ?, ?, ?, 0, ?, ?)
+                        ) VALUES (?, ?, 'processing', ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             idempotency_key,
@@ -305,6 +379,7 @@ class JobStore:
                             incoming_path,
                             proc_str,
                             file_size,
+                            initial_flags,
                             now,
                             now,
                         ),
@@ -376,7 +451,7 @@ class JobStore:
                 cur = conn.execute(
                     """
                     SELECT processing_path FROM clip_jobs
-                    WHERE status = 'processing'
+                    WHERE status IN ('processing', 'pending_remote_sync')
                       AND (step_flags & ?) = ?
                       AND (step_flags & ?) = 0
                       AND clip_id IS NOT NULL
@@ -476,6 +551,8 @@ class JobStore:
         booking_matched_at: float | None = None,
         booking_next_attempt_at: float | None = None,
         clear_booking_next_attempt_at: bool = False,
+        clear_last_error: bool = False,
+        clear_failure_metadata: bool = False,
     ) -> None:
         now = time.time()
         with self._lock:
@@ -517,7 +594,12 @@ class JobStore:
                 if status is not None:
                     fields.append("status = ?")
                     values.append(status)
-                if last_error is not None:
+                if clear_failure_metadata:
+                    fields.append("failure_reason_code = NULL")
+                    fields.append("failure_category = NULL")
+                if clear_last_error:
+                    fields.append("last_error = NULL")
+                elif last_error is not None:
                     fields.append("last_error = ?")
                     values.append(last_error)
                 if failure_category is not None:
@@ -588,4 +670,236 @@ class JobStore:
                 values.append(idempotency_key)
                 sql = f"UPDATE clip_jobs SET {', '.join(fields)} WHERE idempotency_key = ?"
                 conn.execute(sql, values)
+                conn.commit()
+
+    def upsert_remote_sync_pending(
+        self,
+        *,
+        job_uuid: str,
+        idempotency_key: str,
+        processing_path: Path | str,
+        failed_step: str,
+        last_error: str | None,
+        next_retry_time: float,
+    ) -> None:
+        now = time.time()
+        proc = normalize_storage_path(processing_path)
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT retry_count FROM remote_sync_queue WHERE job_uuid = ?",
+                    (job_uuid,),
+                ).fetchone()
+                if row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO remote_sync_queue (
+                            job_uuid, idempotency_key, processing_path, failed_step,
+                            retry_count, drain_attempts, last_error, next_retry_time, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
+                        """,
+                        (
+                            job_uuid,
+                            idempotency_key,
+                            proc,
+                            failed_step,
+                            last_error,
+                            next_retry_time,
+                            now,
+                            now,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE remote_sync_queue SET
+                            idempotency_key = ?,
+                            processing_path = ?,
+                            failed_step = ?,
+                            retry_count = retry_count + 1,
+                            last_error = ?,
+                            next_retry_time = ?,
+                            updated_at = ?
+                        WHERE job_uuid = ?
+                        """,
+                        (
+                            idempotency_key,
+                            proc,
+                            failed_step,
+                            last_error,
+                            next_retry_time,
+                            now,
+                            job_uuid,
+                        ),
+                    )
+                conn.commit()
+
+    def _row_to_remote(self, row: sqlite3.Row) -> RemoteSyncEntry:
+        try:
+            drain = int(row["drain_attempts"] or 0)
+        except (KeyError, IndexError, TypeError, ValueError):
+            drain = 0
+        return RemoteSyncEntry(
+            job_uuid=str(row["job_uuid"]),
+            idempotency_key=str(row["idempotency_key"]),
+            processing_path=str(row["processing_path"]),
+            failed_step=str(row["failed_step"]),
+            retry_count=int(row["retry_count"] or 0),
+            drain_attempts=drain,
+            last_error=row["last_error"],
+            next_retry_time=float(row["next_retry_time"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    def _abort_remote_sync_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        job_uuid: str,
+        idempotency_key: str,
+        reason_code: str,
+        human_message: str,
+        now: float,
+    ) -> None:
+        conn.execute(
+            "DELETE FROM remote_sync_queue WHERE job_uuid = ?",
+            (job_uuid,),
+        )
+        conn.execute(
+            """
+            UPDATE clip_jobs SET
+                status = 'failed',
+                failure_category = 'terminal',
+                failure_reason_code = ?,
+                last_error = ?,
+                current_stage = NULL,
+                updated_at = ?
+            WHERE idempotency_key = ?
+            """,
+            (reason_code, human_message[:1000], now, idempotency_key),
+        )
+
+    def try_begin_remote_sync_drain(
+        self,
+        job_uuid: str,
+        *,
+        now: float,
+        max_total_attempts: int,
+        max_age_seconds: float,
+    ) -> tuple[bool, str | None, str | None]:
+        """
+        Enforce remote-sync zombie limits and reserve one drain attempt.
+
+        Returns ``(proceed, abort_reason, idempotency_key)`` where ``abort_reason`` is
+        ``max_attempts``, ``max_age``, or ``None`` when ``proceed`` is True.
+        When limits are exceeded, the queue row is removed and the clip job is marked failed.
+        """
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM remote_sync_queue WHERE job_uuid = ?",
+                    (job_uuid,),
+                ).fetchone()
+                if row is None:
+                    return False, "missing", None
+                idem = str(row["idempotency_key"])
+                created_at = float(row["created_at"])
+                drain_attempts = int(row["drain_attempts"] or 0)
+
+                if max_age_seconds > 0 and (now - created_at) > max_age_seconds:
+                    self._abort_remote_sync_locked(
+                        conn,
+                        job_uuid=job_uuid,
+                        idempotency_key=idem,
+                        reason_code="remote_sync_max_age",
+                        human_message=(
+                            f"Remote sync abandoned: queued longer than "
+                            f"{max_age_seconds:.0f}s (first queued at {created_at})"
+                        ),
+                        now=now,
+                    )
+                    conn.commit()
+                    return False, "max_age", idem
+
+                if max_total_attempts > 0 and drain_attempts >= max_total_attempts:
+                    self._abort_remote_sync_locked(
+                        conn,
+                        job_uuid=job_uuid,
+                        idempotency_key=idem,
+                        reason_code="remote_sync_max_attempts",
+                        human_message=(
+                            f"Remote sync abandoned after {drain_attempts} drain attempt(s) "
+                            f"(limit {max_total_attempts})"
+                        ),
+                        now=now,
+                    )
+                    conn.commit()
+                    return False, "max_attempts", idem
+
+                conn.execute(
+                    """
+                    UPDATE remote_sync_queue
+                    SET drain_attempts = drain_attempts + 1, updated_at = ?
+                    WHERE job_uuid = ?
+                    """,
+                    (now, job_uuid),
+                )
+                conn.commit()
+                return True, None, idem
+
+    def list_due_remote_sync(
+        self, before_mono: float, *, limit: int = 50
+    ) -> list[RemoteSyncEntry]:
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    SELECT * FROM remote_sync_queue
+                    WHERE next_retry_time <= ?
+                    ORDER BY next_retry_time ASC
+                    LIMIT ?
+                    """,
+                    (before_mono, max(1, limit)),
+                )
+                return [self._row_to_remote(r) for r in cur.fetchall()]
+
+    def delete_remote_sync(self, job_uuid: str) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM remote_sync_queue WHERE job_uuid = ?",
+                    (job_uuid,),
+                )
+                conn.commit()
+
+    def count_remote_sync_pending(self) -> int:
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM remote_sync_queue"
+                ).fetchone()
+                return int(row[0]) if row else 0
+
+    def bump_remote_sync_retry(
+        self,
+        job_uuid: str,
+        *,
+        last_error: str | None,
+        next_retry_time: float,
+    ) -> None:
+        now = time.time()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE remote_sync_queue
+                    SET retry_count = retry_count + 1,
+                        last_error = ?,
+                        next_retry_time = ?,
+                        updated_at = ?
+                    WHERE job_uuid = ?
+                    """,
+                    (last_error, next_retry_time, now, job_uuid),
+                )
                 conn.commit()
