@@ -19,6 +19,7 @@ from processor import (
     clip_path_inflight,
     is_copying_temp_clip,
     is_recently_completed_clip,
+    is_replay_buffer_basename,
     is_video_file,
     should_ignore_file,
 )
@@ -109,6 +110,13 @@ class ClipFileHandler(FileSystemEventHandler):
             )
             return
 
+        if is_replay_buffer_basename(normalized, self._settings):
+            logger.debug(
+                "Watcher ignoring replay-buffer basename",
+                extra={"structured": {"path": str(normalized)}},
+            )
+            return
+
         if not is_video_file(normalized, self._settings):
             return
 
@@ -168,6 +176,13 @@ class ClipJobQueue:
             )
             return
 
+        if is_replay_buffer_basename(normalized, self._settings):
+            logger.info(
+                "Queue rejected: replay-buffer basename (promoted via replay path only)",
+                extra={"structured": {"path": str(normalized)}},
+            )
+            return
+
         if clip_path_inflight(normalized):
             logger.info(
                 "Queue rejected: clip path already in-flight",
@@ -216,6 +231,12 @@ def scan_existing_clips(settings: Settings, submit: Callable[[Path], None]) -> N
             continue
         if should_ignore_file(entry, settings):
             continue
+        if is_replay_buffer_basename(resolved, settings):
+            logger.info(
+                "Startup scan: skipping replay-buffer basename in incoming",
+                extra={"structured": {"path": str(resolved)}},
+            )
+            continue
         if is_recently_completed_clip(entry):
             continue
         if is_video_file(entry, settings):
@@ -236,6 +257,12 @@ def scan_processing_resume(settings: Settings, submit: Callable[[Path], None]) -
         if clip_path_inflight(resolved):
             continue
         if should_ignore_file(entry, settings):
+            continue
+        if is_replay_buffer_basename(resolved, settings):
+            logger.info(
+                "Processing resume scan: skipping replay-buffer basename",
+                extra={"structured": {"path": str(resolved)}},
+            )
             continue
         if is_video_file(entry, settings):
             submit(resolved)

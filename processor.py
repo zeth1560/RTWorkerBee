@@ -287,6 +287,19 @@ def should_ignore_file(path: Path, settings: Settings) -> bool:
     return False
 
 
+def is_replay_buffer_basename(path: Path, settings: Settings) -> bool:
+    """
+    True for names matching ``replay_buffer_filename_prefix`` (OBS replay-buffer saves).
+
+    These clips are promoted only via the replay-buffer path (scoreboard + renamed incoming copy);
+    they must not be queued for normal ``process_clip``.
+    """
+    pfx = settings.replay_buffer_filename_prefix
+    if not pfx:
+        return False
+    return path.name.lower().startswith(pfx.lower())
+
+
 def clip_readiness_gate(path: Path, settings: Settings) -> bool:
     """
     Before full stabilization, require min age, unlocked, and unchanged size/mtime across
@@ -951,6 +964,13 @@ def process_clip(
     if should_ignore_file(clip_path, settings):
         logger.info(
             "Ignoring file by configured name/pattern",
+            extra={"structured": {"path": str(clip_path)}},
+        )
+        return
+
+    if is_replay_buffer_basename(clip_path, settings):
+        logger.info(
+            "Skipping replay-buffer basename (use replay promotion; not standard clip processing)",
             extra={"structured": {"path": str(clip_path)}},
         )
         return

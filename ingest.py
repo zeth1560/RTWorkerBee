@@ -56,6 +56,14 @@ def _local_timestamp_basename(settings: Settings, suffix: str) -> str:
     return datetime.now(zone).strftime("%Y-%m-%dT%H-%M-%S") + suffix.lower()
 
 
+def incoming_clip_local_basename(settings: Settings, suffix: str = ".mp4") -> str:
+    """
+    Local OBS-style basename for a clip placed in incoming (``YYYY-MM-DDTHH-MM-SS.mp4``).
+    Shared with replay-buffer promotion; long-clips ingest continues to use internal helpers only.
+    """
+    return _local_timestamp_basename(settings, suffix)
+
+
 def _file_sig(path: Path) -> tuple[int, float] | None:
     try:
         st = path.stat()
@@ -367,6 +375,10 @@ def _long_clips_scan_pass(
         if is_copying_temp_clip(entry, settings):
             continue
         if not is_video_file(entry, settings):
+            continue
+
+        rp = settings.replay_buffer_filename_prefix
+        if rp and entry.name.lower().startswith(rp.lower()):
             continue
 
         key = str(entry.resolve(strict=False)).lower()

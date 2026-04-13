@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from config import ConfigError, Settings, load_settings
 from connectivity import ConnectivityMonitor
@@ -29,6 +30,15 @@ from lifecycle_events import (
 )
 from network_retry import backoff_delay_seconds
 from processor import is_copying_temp_clip, is_video_file, process_clip
+from replay_buffer_command import (
+    ProcessLatestReplayResult,
+    replay_scoreboard_auto_sync_loop,
+    run_process_latest_replay_cli,
+)
+from replay_trigger_http import (
+    run_replay_trigger_http_loop,
+    serve_replay_trigger_http_blocking,
+)
 from uploader import S3Uploader
 from worker_status import WorkerStatusReporter
 from watcher import (
@@ -50,7 +60,293 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="Path to .env file (optional)",
     )
+    sub = parser.add_subparsers(dest="command", required=False)
+    sub.add_parser("run", help="Run the full worker (default when no subcommand is given)")
+    rp = sub.add_parser(
+        "process-latest-replay",
+        aliases=["replay-latest"],
+        help=(
+            "Replay-buffer only: newest replay_*.mp4 under LONG_CLIPS, stabilize, "
+            "copy to INSTANTREPLAY.mp4 (scoreboard) and incoming (OBS basename without replay_ prefix), "
+            "verify, delete source, then process_clip once on the incoming copy"
+        ),
+    )
+    rp.add_argument(
+        "--trigger",
+        required=True,
+        help="Trigger time: Unix epoch seconds or ISO-8601 (e.g. 2026-04-13T12:00:00Z)",
+    )
+    rp.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Max seconds to find a file and finish stabilization (default: 120)",
+    )
+    rp.add_argument(
+        "--prefix",
+        default="replay_",
+        help="Replay basename prefix (default: replay_)",
+    )
+    rp.add_argument(
+        "--tolerance",
+        type=float,
+        default=10.0,
+        help="Accept files with mtime up to this many seconds before --trigger (default: 10)",
+    )
+    rth = sub.add_parser(
+        "replay-trigger-http",
+        help=(
+            "Local-only HTTP server (loopback): trigger replay-buffer processing via GET/POST /replay"
+        ),
+    )
+    rth.add_argument(
+        "--host",
+        default=None,
+        help="Bind address (default: REPLAY_TRIGGER_HTTP_HOST or 127.0.0.1)",
+    )
+    rth.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="TCP port (default: REPLAY_TRIGGER_HTTP_PORT env; required if unset)",
+    )
     return parser.parse_args(argv)
+
+
+def _replay_pipeline_structured(request_id: str | None, **kwargs: object) -> dict[str, object]:
+    out: dict[str, object] = {k: v for k, v in kwargs.items() if v is not None}
+    if request_id:
+        out["request_id"] = request_id
+    return out
+
+
+def run_process_latest_replay_pipeline(
+    settings: Settings,
+    *,
+    trigger_raw: str,
+    timeout_seconds: float,
+    filename_prefix: str,
+    tolerance_seconds: float,
+    request_id: str | None = None,
+    connectivity: ConnectivityMonitor | None = None,
+    supabase: Any | None = None,
+    primary_uploader: S3Uploader | None = None,
+    job_store: JobStore | None = None,
+    status_reporter: WorkerStatusReporter | None = None,
+    long_clip_semaphore: threading.BoundedSemaphore | None = None,
+) -> tuple[ProcessLatestReplayResult, int]:
+    """
+    Full replay-buffer path: scan/stabilize/dual-copy, then ``process_clip`` on the incoming file.
+
+    When ``connectivity`` and related deps are omitted, builds fresh clients (CLI / standalone HTTP).
+    When provided (embedded in running worker), reuses them.
+    """
+    logger.info(
+        "replay-processing: pipeline starting",
+        extra={
+            "structured": _replay_pipeline_structured(
+                request_id,
+                trigger=trigger_raw[:120],
+                timeout_seconds=timeout_seconds,
+                prefix=filename_prefix,
+                tolerance_seconds=tolerance_seconds,
+            )
+        },
+    )
+
+    result = run_process_latest_replay_cli(
+        settings,
+        trigger_raw=trigger_raw,
+        timeout_seconds=timeout_seconds,
+        filename_prefix=filename_prefix,
+        tolerance_seconds=tolerance_seconds,
+        request_id=request_id,
+    )
+
+    if not result.success:
+        logger.warning(
+            "replay-processing: replay-buffer stage failed",
+            extra={
+                "structured": _replay_pipeline_structured(
+                    request_id,
+                    failure_reason=result.failure_reason,
+                )
+            },
+        )
+        return result, 1
+
+    use_shared = connectivity is not None
+    if not use_shared:
+        connectivity = ConnectivityMonitor(
+            settings,
+            interval_seconds=settings.connectivity_check_interval_seconds,
+            probe_timeout_seconds=settings.connectivity_probe_timeout_seconds,
+        )
+        try:
+            _warm_supabase(settings)
+        except Exception as exc:
+            logger.warning(
+                "replay-processing: Supabase warm-up failed (continuing): %s",
+                exc,
+                extra={
+                    "structured": _replay_pipeline_structured(
+                        request_id,
+                        error_class=type(exc).__name__,
+                    )
+                },
+            )
+            connectivity.mark_startup_offline_mode()
+
+    if supabase is None:
+        supabase = create_supabase_client(settings)
+    if primary_uploader is None:
+        primary_uploader = S3Uploader(
+            bucket=settings.s3_bucket,
+            region=settings.aws_region,
+            access_key_id=settings.aws_access_key_id,
+            secret_access_key=settings.aws_secret_access_key,
+            upload_retries=settings.upload_retries,
+            upload_retry_delay_seconds=settings.upload_retry_delay_seconds,
+            label="primary",
+            multipart_threshold_bytes=settings.s3_multipart_threshold_bytes,
+            multipart_chunksize_bytes=settings.s3_multipart_chunksize_bytes,
+            network_retry_base_seconds=settings.network_retry_base_seconds,
+            network_retry_max_seconds=settings.network_retry_max_seconds,
+            network_retry_jitter_fraction=settings.network_retry_jitter_fraction,
+        )
+    if job_store is None:
+        job_store = JobStore(settings.job_db_path)
+        job_store.init_schema()
+    if status_reporter is None:
+        status_reporter = WorkerStatusReporter(settings.worker_status_json_path)
+
+    assert result.incoming_path is not None
+    incoming = Path(result.incoming_path)
+    try:
+        process_clip(
+            incoming,
+            settings,
+            primary_uploader,
+            supabase,
+            job_store,
+            long_clip_semaphore=long_clip_semaphore,
+            connectivity=connectivity,
+            on_original_upload_complete=status_reporter.record_original_upload_success,
+        )
+    except Exception as exc:
+        logger.exception(
+            "replay-processing: process_clip failed",
+            extra={
+                "structured": _replay_pipeline_structured(
+                    request_id,
+                    path=str(incoming),
+                )
+            },
+        )
+        failed = ProcessLatestReplayResult(
+            success=False,
+            selected_source_path=result.selected_source_path,
+            incoming_path=result.incoming_path,
+            detected_at=result.detected_at,
+            stability_confirmed=result.stability_confirmed,
+            failure_reason="processing_exception",
+            scoreboard_replay_path=result.scoreboard_replay_path,
+            processing_error=str(exc)[:500],
+            source_deleted=result.source_deleted,
+        )
+        return failed, 1
+
+    logger.info(
+        "replay-processing: pipeline completed",
+        extra={
+            "structured": _replay_pipeline_structured(
+                request_id,
+                selected_source_path=result.selected_source_path,
+                incoming_path=result.incoming_path,
+                scoreboard_replay_path=result.scoreboard_replay_path,
+                source_deleted=result.source_deleted,
+            )
+        },
+    )
+    return result, 0
+
+
+def _run_process_latest_replay_command(settings: Settings, args: argparse.Namespace) -> int:
+    """Minimal worker deps + replay scan/stabilize/copy + single process_clip. Exits process."""
+    _ensure_directories(settings)
+    setup_logging(settings.log_folder)
+
+    logger.info(
+        "process-latest-replay command",
+        extra={
+            "structured": {
+                "trigger": args.trigger,
+                "timeout": args.timeout,
+                "prefix": args.prefix,
+                "tolerance": args.tolerance,
+            }
+        },
+    )
+
+    result, exit_code = run_process_latest_replay_pipeline(
+        settings,
+        trigger_raw=args.trigger,
+        timeout_seconds=args.timeout,
+        filename_prefix=args.prefix,
+        tolerance_seconds=args.tolerance,
+        request_id=None,
+    )
+    print(result.to_json(), flush=True)
+    return exit_code
+
+
+def _run_replay_trigger_http_command(settings: Settings, args: argparse.Namespace) -> int:
+    """Run a blocking local HTTP server that triggers :func:`run_process_latest_replay_pipeline`."""
+    _ensure_directories(settings)
+    setup_logging(settings.log_folder)
+
+    host = args.host or settings.replay_trigger_http_host
+    port = args.port if args.port is not None else settings.replay_trigger_http_port
+    if port is None:
+        print(
+            "replay-trigger-http: set REPLAY_TRIGGER_HTTP_PORT or pass --port",
+            file=sys.stderr,
+        )
+        return 2
+
+    def run_pipeline(
+        *,
+        trigger_raw: str,
+        timeout_seconds: float,
+        request_id: str | None,
+        filename_prefix: str,
+        tolerance_seconds: float,
+    ) -> tuple[ProcessLatestReplayResult, int]:
+        return run_process_latest_replay_pipeline(
+            settings,
+            trigger_raw=trigger_raw,
+            timeout_seconds=timeout_seconds,
+            filename_prefix=filename_prefix,
+            tolerance_seconds=tolerance_seconds,
+            request_id=request_id,
+        )
+
+    logger.info(
+        "replay-trigger-http: starting standalone server",
+        extra={"structured": {"host": host, "port": port}},
+    )
+    try:
+        serve_replay_trigger_http_blocking(
+            host,
+            port,
+            run_pipeline,
+            default_timeout=120.0,
+            default_prefix=settings.replay_buffer_filename_prefix,
+            default_tolerance=10.0,
+        )
+    except KeyboardInterrupt:
+        logger.info("replay-trigger-http: interrupted")
+    return 0
 
 
 def _ensure_directories(settings: Settings) -> None:
@@ -77,6 +373,12 @@ def _ensure_directories(settings: Settings) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         if not p.exists():
             p.touch()
+    if settings.instant_replay_source is not None:
+        ir = settings.instant_replay_source.expanduser().resolve(strict=False)
+        if ir.is_dir():
+            ir.mkdir(parents=True, exist_ok=True)
+        else:
+            ir.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _warm_supabase(settings: Settings) -> None:
@@ -103,12 +405,24 @@ def _count_clip_videos(folder: Path, settings: Settings) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    argv_list = sys.argv[1:] if argv is None else argv
+    args = _parse_args(argv_list)
 
     try:
         settings = load_settings(env_file=args.env)
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    command = args.command
+    if command is None:
+        command = "run"
+    if command in ("process-latest-replay", "replay-latest"):
+        return _run_process_latest_replay_command(settings, args)
+    if command == "replay-trigger-http":
+        return _run_replay_trigger_http_command(settings, args)
+    if command != "run":
+        print(f"Unknown command: {command}", file=sys.stderr)
         return 2
 
     _ensure_directories(settings)
@@ -153,6 +467,14 @@ def main(argv: list[str] | None = None) -> int:
                 if settings.long_clips_trigger_file
                 else None,
                 "long_clips_scan_interval_seconds": settings.long_clips_scan_interval_seconds,
+                "replay_trigger_http_host": settings.replay_trigger_http_host,
+                "replay_trigger_http_port": settings.replay_trigger_http_port,
+                "replay_buffer_filename_prefix": settings.replay_buffer_filename_prefix,
+                "replay_scoreboard_auto_sync_interval_seconds": settings.replay_scoreboard_auto_sync_interval_seconds,
+                "replay_buffer_stable_check_seconds": settings.replay_buffer_stable_check_seconds,
+                "replay_buffer_stable_min_age_seconds": settings.replay_buffer_stable_min_age_seconds,
+                "replay_buffer_stable_rounds_required": settings.replay_buffer_stable_rounds_required,
+                "replay_buffer_delete_source_after_success": settings.replay_buffer_delete_source_after_success,
             }
         },
     )
@@ -227,6 +549,8 @@ def main(argv: list[str] | None = None) -> int:
 
     job_queue = ClipJobQueue(settings)
     stop = threading.Event()
+    replay_trigger_thread: threading.Thread | None = None
+    replay_auto_thread: threading.Thread | None = None
 
     connectivity_thread = threading.Thread(
         target=lambda: connectivity.run_loop(stop),
@@ -234,6 +558,52 @@ def main(argv: list[str] | None = None) -> int:
         daemon=True,
     )
     connectivity_thread.start()
+
+    if settings.replay_trigger_http_port is not None:
+        bind_host = settings.replay_trigger_http_host
+        bind_port = settings.replay_trigger_http_port
+
+        def _replay_http_pipeline(
+            *,
+            trigger_raw: str,
+            timeout_seconds: float,
+            request_id: str | None,
+            filename_prefix: str,
+            tolerance_seconds: float,
+        ) -> tuple[ProcessLatestReplayResult, int]:
+            return run_process_latest_replay_pipeline(
+                settings,
+                trigger_raw=trigger_raw,
+                timeout_seconds=timeout_seconds,
+                filename_prefix=filename_prefix,
+                tolerance_seconds=tolerance_seconds,
+                request_id=request_id,
+                connectivity=connectivity,
+                supabase=supabase,
+                primary_uploader=primary_uploader,
+                job_store=job_store,
+                status_reporter=status_reporter,
+                long_clip_semaphore=long_clip_sem,
+            )
+
+        def _replay_trigger_http_main() -> None:
+            try:
+                run_replay_trigger_http_loop(
+                    bind_host,
+                    bind_port,
+                    _replay_http_pipeline,
+                    stop,
+                    default_prefix=settings.replay_buffer_filename_prefix,
+                )
+            except Exception:
+                logger.exception("replay-trigger-http: embedded server thread exited")
+
+        replay_trigger_thread = threading.Thread(
+            target=_replay_trigger_http_main,
+            name="replay-trigger-http",
+            daemon=True,
+        )
+        replay_trigger_thread.start()
 
     def submit_job(path: Path) -> None:
         normalized = _normalize_path(path)
@@ -285,6 +655,24 @@ def main(argv: list[str] | None = None) -> int:
         )
         t.start()
         workers.append(t)
+
+    if (
+        settings.replay_scoreboard_auto_sync_interval_seconds > 0
+        and settings.long_clips_folder is not None
+    ):
+
+        def _replay_auto_main() -> None:
+            try:
+                replay_scoreboard_auto_sync_loop(settings, submit_job, stop)
+            except Exception:
+                logger.exception("replay-buffer: auto-sync thread exited")
+
+        replay_auto_thread = threading.Thread(
+            target=_replay_auto_main,
+            name="replay-scoreboard-auto-sync",
+            daemon=True,
+        )
+        replay_auto_thread.start()
 
     booking_thread: threading.Thread | None = None
     if settings.unmatched_booking_retry_seconds > 0:
@@ -617,6 +1005,10 @@ def main(argv: list[str] | None = None) -> int:
     if status_thread is not None:
         status_thread.join(timeout=2)
     connectivity_thread.join(timeout=2)
+    if replay_trigger_thread is not None:
+        replay_trigger_thread.join(timeout=2)
+    if replay_auto_thread is not None:
+        replay_auto_thread.join(timeout=2)
     for t in ingest_threads:
         t.join(timeout=5)
 

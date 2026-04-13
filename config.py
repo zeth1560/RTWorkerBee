@@ -210,6 +210,17 @@ class Settings:
     worker_status_json_path: Path
     worker_status_write_interval_seconds: float
 
+    replay_trigger_http_host: str
+    replay_trigger_http_port: int | None
+
+    replay_buffer_filename_prefix: str
+    replay_scoreboard_auto_sync_interval_seconds: float
+    replay_buffer_stable_check_seconds: float
+    replay_buffer_stable_min_age_seconds: float
+    replay_buffer_stable_rounds_required: int
+    replay_buffer_stable_max_retries: int
+    replay_buffer_delete_source_after_success: bool
+
 
 def load_settings(env_file: Path | None = None) -> Settings:
     """
@@ -590,6 +601,47 @@ def load_settings(env_file: Path | None = None) -> Settings:
         minimum=0.0,
     )
 
+    replay_trigger_host = _optional("REPLAY_TRIGGER_HTTP_HOST", "127.0.0.1")
+    replay_trigger_port_raw = os.environ.get("REPLAY_TRIGGER_HTTP_PORT", "").strip()
+    if not replay_trigger_port_raw:
+        replay_trigger_http_port: int | None = None
+    else:
+        replay_trigger_http_port = _parse_int(
+            "REPLAY_TRIGGER_HTTP_PORT",
+            replay_trigger_port_raw,
+            minimum=1,
+        )
+
+    replay_buffer_filename_prefix = _optional("REPLAY_BUFFER_FILENAME_PREFIX", "replay_")
+    replay_scoreboard_auto_sync_iv = _parse_float(
+        "REPLAY_SCOREBOARD_AUTO_SYNC_INTERVAL_SECONDS",
+        _optional("REPLAY_SCOREBOARD_AUTO_SYNC_INTERVAL_SECONDS", "0.05"),
+        minimum=0.0,
+    )
+    replay_buf_stable_chk = _parse_float(
+        "REPLAY_BUFFER_STABLE_CHECK_SECONDS",
+        _optional("REPLAY_BUFFER_STABLE_CHECK_SECONDS", "0.08"),
+        minimum=0.05,
+    )
+    replay_buf_stable_min_age = _parse_float(
+        "REPLAY_BUFFER_STABLE_MIN_AGE_SECONDS",
+        _optional("REPLAY_BUFFER_STABLE_MIN_AGE_SECONDS", "0.1"),
+        minimum=0.0,
+    )
+    replay_buf_stable_rounds = _parse_int(
+        "REPLAY_BUFFER_STABLE_ROUNDS",
+        _optional("REPLAY_BUFFER_STABLE_ROUNDS", "2"),
+        minimum=1,
+    )
+    replay_buf_stable_max_ret = _parse_int(
+        "REPLAY_BUFFER_STABLE_MAX_RETRIES",
+        _optional("REPLAY_BUFFER_STABLE_MAX_RETRIES", "80"),
+        minimum=5,
+    )
+    replay_buf_delete_src = _parse_bool(
+        _optional("REPLAY_BUFFER_DELETE_SOURCE_AFTER_SUCCESS", "true")
+    )
+
     return Settings(
         clips_incoming_folder=incoming,
         clips_processing_folder=processing,
@@ -685,6 +737,15 @@ def load_settings(env_file: Path | None = None) -> Settings:
         remote_sync_max_age_seconds=remote_sync_max_age,
         worker_status_json_path=status_json,
         worker_status_write_interval_seconds=status_write_iv,
+        replay_trigger_http_host=replay_trigger_host,
+        replay_trigger_http_port=replay_trigger_http_port,
+        replay_buffer_filename_prefix=replay_buffer_filename_prefix,
+        replay_scoreboard_auto_sync_interval_seconds=replay_scoreboard_auto_sync_iv,
+        replay_buffer_stable_check_seconds=replay_buf_stable_chk,
+        replay_buffer_stable_min_age_seconds=replay_buf_stable_min_age,
+        replay_buffer_stable_rounds_required=replay_buf_stable_rounds,
+        replay_buffer_stable_max_retries=replay_buf_stable_max_ret,
+        replay_buffer_delete_source_after_success=replay_buf_delete_src,
     )
 
 

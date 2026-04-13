@@ -253,8 +253,9 @@ class JobStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             with self._connect() as conn:
-                _migrate_clip_jobs(conn)
+                # WAL must run before any migration DDL — SQLite rejects it inside a transaction.
                 conn.execute("PRAGMA journal_mode=WAL")
+                _migrate_clip_jobs(conn)
                 conn.commit()
 
     def _normalize_step_flags(self, flags: int, status: str) -> int:
