@@ -1,7 +1,7 @@
 """
 Ingest OBS outputs that are not written directly as timestamped clips:
 
-- Instant replay: copy INSTANTREPLAY.mp4 into clips with a local-timestamp name.
+- Instant replay: copy ``INSTANTREPLAY.mkv`` into clips with a local-timestamp name (same container as the source).
   Either poll the source for changes, or react to INSTANT_REPLAY_TRIGGER_FILE (mtime).
 - Long recordings: promote from long_clips after stability; optional LONG_CLIPS_TRIGGER_FILE
   wakes a scan early; LONG_CLIPS_SCAN_INTERVAL_SECONDS=0 disables periodic polling.

@@ -220,6 +220,8 @@ class Settings:
     replay_buffer_stable_rounds_required: int
     replay_buffer_stable_max_retries: int
     replay_buffer_delete_source_after_success: bool
+    replay_buffer_remux_max_attempts: int
+    replay_buffer_remux_retry_delay_seconds: float
 
 
 def load_settings(env_file: Path | None = None) -> Settings:
@@ -287,7 +289,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
     club = _require("CLUB_ID")
     court = _require("COURT_ID")
 
-    exts = _parse_extensions(_optional("VIDEO_EXTENSIONS", ".mp4,.mov"))
+    exts = _parse_extensions(_optional("VIDEO_EXTENSIONS", ".mp4,.mov,.mkv"))
 
     preview_width = _parse_int("PREVIEW_WIDTH", _optional("PREVIEW_WIDTH", "640"), minimum=16)
     preview_crf = _parse_int("PREVIEW_CRF", _optional("PREVIEW_CRF", "30"), minimum=0)
@@ -354,7 +356,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
     )
 
     ignore_filenames = _parse_csv_strings(
-        _optional("IGNORE_FILENAMES", "InstantReplay.mp4")
+        _optional("IGNORE_FILENAMES", "InstantReplay.mp4,InstantReplay.mkv")
     )
     ignore_prefixes = _parse_csv_strings(
         _optional("IGNORE_PREFIXES", "~,.")
@@ -369,7 +371,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         ir = os.environ["INSTANT_REPLAY_SOURCE"].strip()
         instant_replay_source = Path(ir) if ir else None
     else:
-        instant_replay_source = Path(r"C:\ReplayTrove\INSTANTREPLAY.mp4")
+        instant_replay_source = Path(r"C:\ReplayTrove\INSTANTREPLAY.mkv")
 
     if "LONG_CLIPS_FOLDER" in os.environ:
         lc = os.environ["LONG_CLIPS_FOLDER"].strip()
@@ -641,6 +643,16 @@ def load_settings(env_file: Path | None = None) -> Settings:
     replay_buf_delete_src = _parse_bool(
         _optional("REPLAY_BUFFER_DELETE_SOURCE_AFTER_SUCCESS", "true")
     )
+    replay_buf_remux_attempts = _parse_int(
+        "REPLAY_BUFFER_REMUX_MAX_ATTEMPTS",
+        _optional("REPLAY_BUFFER_REMUX_MAX_ATTEMPTS", "10"),
+        minimum=1,
+    )
+    replay_buf_remux_delay = _parse_float(
+        "REPLAY_BUFFER_REMUX_RETRY_DELAY_SECONDS",
+        _optional("REPLAY_BUFFER_REMUX_RETRY_DELAY_SECONDS", "4"),
+        minimum=0,
+    )
 
     return Settings(
         clips_incoming_folder=incoming,
@@ -746,6 +758,8 @@ def load_settings(env_file: Path | None = None) -> Settings:
         replay_buffer_stable_rounds_required=replay_buf_stable_rounds,
         replay_buffer_stable_max_retries=replay_buf_stable_max_ret,
         replay_buffer_delete_source_after_success=replay_buf_delete_src,
+        replay_buffer_remux_max_attempts=replay_buf_remux_attempts,
+        replay_buffer_remux_retry_delay_seconds=replay_buf_remux_delay,
     )
 
 

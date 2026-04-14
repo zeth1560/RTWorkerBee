@@ -66,9 +66,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "process-latest-replay",
         aliases=["replay-latest"],
         help=(
-            "Replay-buffer only: newest replay_*.mp4 under LONG_CLIPS, stabilize, "
-            "copy to INSTANTREPLAY.mp4 (scoreboard) and incoming (OBS basename without replay_ prefix), "
-            "verify, delete source, then process_clip once on the incoming copy"
+            "Replay-buffer only: newest replay_*.mkv under LONG_CLIPS, stabilize, "
+            "remux to MP4 for incoming, copy to INSTANTREPLAY.mkv (scoreboard), "
+            "verify, delete or fail-move source, then process_clip once on the incoming MP4"
         ),
     )
     rp.add_argument(
@@ -475,6 +475,8 @@ def main(argv: list[str] | None = None) -> int:
                 "replay_buffer_stable_min_age_seconds": settings.replay_buffer_stable_min_age_seconds,
                 "replay_buffer_stable_rounds_required": settings.replay_buffer_stable_rounds_required,
                 "replay_buffer_delete_source_after_success": settings.replay_buffer_delete_source_after_success,
+                "replay_buffer_remux_max_attempts": settings.replay_buffer_remux_max_attempts,
+                "replay_buffer_remux_retry_delay_seconds": settings.replay_buffer_remux_retry_delay_seconds,
             }
         },
     )

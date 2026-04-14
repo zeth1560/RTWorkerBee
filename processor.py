@@ -869,6 +869,111 @@ def run_ffmpeg_preview(
         )
 
 
+def run_ffmpeg_remux_to_mp4(
+    settings: Settings,
+    input_path: Path,
+    output_path: Path,
+) -> None:
+    """
+    Remux ``input_path`` into MP4 with stream copy (no re-encode). Requires codecs
+    compatible with the MP4 container (e.g. H.264 + AAC).
+    """
+    ffmpeg_exe = resolve_ffmpeg_path(settings)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_exe,
+        "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(input_path),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    logger.info(
+        "Running ffmpeg remux to mp4",
+        extra={
+            "structured": {
+                "cmd": " ".join(cmd),
+                "input": str(input_path),
+                "output": str(output_path),
+            }
+        },
+    )
+    run_kw: dict[str, object] = {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+        "stdin": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32":
+        run_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    proc = subprocess.run(cmd, **run_kw)
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "")[-4000:]
+        stdout = (proc.stdout or "")[-2000:]
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if _stderr_suggests_decode_corruption(proc.stderr or ""):
+            raise FfmpegDecodeError(
+                f"ffmpeg remux failure (code {proc.returncode}). "
+                f"stdout={stdout!r} stderr={stderr!r}"
+            )
+        raise RuntimeError(
+            f"ffmpeg remux failed (code {proc.returncode}). stdout={stdout!r} stderr={stderr!r}"
+        )
+
+
+def remux_to_mp4_with_retries(
+    settings: Settings,
+    input_path: Path,
+    output_path: Path,
+    *,
+    log_context: str,
+) -> tuple[bool, str | None]:
+    """
+    Remux to ``output_path`` with :func:`run_ffmpeg_remux_to_mp4`, retrying transient
+    failures. Returns ``(True, None)`` or ``(False, reason)``.
+    """
+    max_attempts = max(1, settings.replay_buffer_remux_max_attempts)
+    delay = settings.replay_buffer_remux_retry_delay_seconds
+    last_err: str | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            run_ffmpeg_remux_to_mp4(settings, input_path, output_path)
+        except (RuntimeError, FfmpegDecodeError, FileNotFoundError) as exc:
+            last_err = str(exc)[:500]
+            logger.warning(
+                "Remux to mp4 failed",
+                extra={
+                    "structured": {
+                        "context": log_context,
+                        "input": str(input_path),
+                        "output": str(output_path),
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "error": last_err,
+                    }
+                },
+            )
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if attempt < max_attempts and delay > 0:
+                time.sleep(delay)
+            continue
+        return True, None
+    return False, last_err or "remux_exhausted"
+
+
 def build_preview_filename(original: Path) -> str:
     """Preview is always MP4 per pilot pipeline."""
     return f"{original.stem}.mp4"
