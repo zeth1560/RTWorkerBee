@@ -726,30 +726,23 @@ def _replay_buffer_dual_copy_and_delete_source(
         )
 
     deleted = False
-    if settings.replay_buffer_delete_source_after_success:
-        try:
-            src_resolved.unlink()
-            deleted = True
-            logger.info(
-                "replay-buffer: removed source replay from long_clips after successful dual copy",
-                extra={"structured": {"source": str(src_resolved)}},
-            )
-        except OSError as exc:
-            logger.warning(
-                "replay-buffer: dual copy succeeded but could not delete long_clips source "
-                "(replay job still successful)",
-                exc_info=True,
-                extra={
-                    "structured": {
-                        "source": str(src_resolved),
-                        "error": str(exc)[:500],
-                    }
-                },
-            )
-    else:
+    try:
+        src_resolved.unlink()
+        deleted = True
         logger.info(
-            "replay-buffer: retaining long_clips source (REPLAY_BUFFER_DELETE_SOURCE_AFTER_SUCCESS disabled)",
+            "replay-buffer: removed source replay from long_clips after successful remux/promotion",
             extra={"structured": {"source": str(src_resolved)}},
+        )
+    except OSError as exc:
+        logger.warning(
+            "replay-buffer: remux/promotion succeeded but could not delete long_clips source",
+            exc_info=True,
+            extra={
+                "structured": {
+                    "source": str(src_resolved),
+                    "error": str(exc)[:500],
+                }
+            },
         )
 
     incoming_final = incoming_dest.resolve(strict=False)

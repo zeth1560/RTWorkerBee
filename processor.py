@@ -1366,6 +1366,33 @@ def process_clip(
                     )
                     return
 
+            if clip_path.suffix.lower() != ".mp4":
+                source_before_remux = clip_path
+                remux_target = unique_destination(clip_path.parent, f"{clip_path.stem}.mp4")
+                ok_remux, remux_err = remux_to_mp4_with_retries(
+                    settings,
+                    clip_path,
+                    remux_target,
+                    log_context="process_clip",
+                )
+                if not ok_remux:
+                    raise RuntimeError(
+                        f"processing_remux_failed: source={clip_path} error={remux_err}"
+                    )
+                clip_path = remux_target.resolve(strict=False)
+                job_store.update_job(
+                    idem,
+                    processing_path=normalize_storage_path(clip_path),
+                    utc_filename=clip_path.name,
+                )
+                try:
+                    source_before_remux.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Could not remove source after successful remux",
+                        extra={"structured": {"path": str(source_before_remux)}},
+                    )
+
             try:
                 sz_policy = clip_path.stat().st_size
             except OSError:

@@ -155,6 +155,15 @@ def _instant_replay_try_promote(
     if suffix not in settings.video_extensions:
         last_promoted[0] = sig2
         return
+    if suffix == ".mkv":
+        # Replay-buffer path already promotes replay_*.mkv into incoming MP4.
+        # Prevent duplicate uploads by not ingesting scoreboard MKV snapshots.
+        last_promoted[0] = sig2
+        logger.info(
+            "Instant replay: skipping mkv source ingest (scoreboard-only file)",
+            extra={"structured": {"source": str(path)}},
+        )
+        return
 
     name = _local_timestamp_basename(settings, suffix)
     final_dest = unique_destination(settings.clips_incoming_folder, name)
