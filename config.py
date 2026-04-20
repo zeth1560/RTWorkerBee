@@ -113,6 +113,7 @@ class Settings:
     supabase_url: str
     supabase_key: str
     supabase_clips_table: str
+    supabase_bookings_table: str
 
     pickle_planner_match_url: str
     pickle_planner_api_key: str
@@ -281,6 +282,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
     sb_url = _require("SUPABASE_URL")
     sb_key = _require("SUPABASE_KEY")
     clips_table = _optional("SUPABASE_CLIPS_TABLE", "clips")
+    bookings_table = _optional("SUPABASE_BOOKINGS_TABLE", "bookings")
 
     pp_match_url = _require("PICKLE_PLANNER_MATCH_URL")
     pp_api_key = _require("PICKLE_PLANNER_API_KEY")
@@ -291,8 +293,8 @@ def load_settings(env_file: Path | None = None) -> Settings:
 
     exts = _parse_extensions(_optional("VIDEO_EXTENSIONS", ".mp4,.mov,.mkv"))
 
-    preview_width = _parse_int("PREVIEW_WIDTH", _optional("PREVIEW_WIDTH", "640"), minimum=16)
-    preview_crf = _parse_int("PREVIEW_CRF", _optional("PREVIEW_CRF", "30"), minimum=0)
+    preview_width = _parse_int("PREVIEW_WIDTH", _optional("PREVIEW_WIDTH", "426"), minimum=16)
+    preview_crf = _parse_int("PREVIEW_CRF", _optional("PREVIEW_CRF", "36"), minimum=0)
     preview_preset = _optional("PREVIEW_PRESET", "fast")
 
     stable_sec = _parse_float(
@@ -678,6 +680,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         supabase_url=sb_url,
         supabase_key=sb_key,
         supabase_clips_table=clips_table,
+        supabase_bookings_table=bookings_table,
         pickle_planner_match_url=pp_match_url,
         pickle_planner_api_key=pp_api_key,
         pickle_planner_api_key_header=pp_api_key_header,

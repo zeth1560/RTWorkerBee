@@ -5,6 +5,7 @@ End-to-end processing for a single clip: stabilize, rename to UTC, preview, uplo
 from __future__ import annotations
 
 import logging
+import math
 import re
 import shutil
 import subprocess
@@ -22,7 +23,11 @@ from supabase import Client
 from clip_fingerprint import compute_clip_idempotency_key
 from connectivity import ConnectivityMonitor
 from config import Settings, slug_from_stem
-from database import update_clip_booking_id, upsert_clip_record
+from database import (
+    update_clip_booking_id,
+    upsert_booking_from_match,
+    upsert_clip_record,
+)
 from job_store import (
     ClipJob,
     JobIdempotencyCollisionError,
@@ -56,7 +61,7 @@ from lifecycle_events import (
 )
 from network_retry import NonRetryableDependencyError, TransientNetworkError
 from paths import normalize_storage_path
-from pickle_planner import get_booking_id_for_clip
+from pickle_planner import get_booking_match_for_clip
 from uploader import S3Uploader
 
 logger = logging.getLogger(__name__)
@@ -759,6 +764,79 @@ def resolve_ffmpeg_path(settings: Settings) -> str:
     )
 
 
+def resolve_ffprobe_path(settings: Settings) -> str:
+    ffmpeg_exe = resolve_ffmpeg_path(settings)
+    ffmpeg_path = Path(ffmpeg_exe)
+    ffprobe_guess = ffmpeg_path.with_name(
+        ffmpeg_path.name.replace("ffmpeg", "ffprobe")
+    )
+    if ffprobe_guess.exists() and ffprobe_guess.is_file():
+        return str(ffprobe_guess)
+    discovered = shutil.which("ffprobe")
+    if discovered:
+        return discovered
+    raise FileNotFoundError(
+        f"ffprobe executable not found. Checked sibling of {ffmpeg_exe!r} and PATH."
+    )
+
+
+def probe_duration_seconds(settings: Settings, input_path: Path) -> float | None:
+    """
+    Return media duration in seconds from ffprobe when available; otherwise None.
+    """
+    try:
+        ffprobe_exe = resolve_ffprobe_path(settings)
+    except FileNotFoundError:
+        logger.warning(
+            "Could not resolve ffprobe for duration probe",
+            extra={"structured": {"input": str(input_path)}},
+        )
+        return None
+
+    cmd = [
+        ffprobe_exe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(input_path),
+    ]
+    run_kw: dict[str, object] = {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+        "stdin": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32":
+        run_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    proc = subprocess.run(cmd, **run_kw)
+    if proc.returncode != 0:
+        logger.warning(
+            "ffprobe duration probe failed",
+            extra={
+                "structured": {
+                    "input": str(input_path),
+                    "returncode": proc.returncode,
+                }
+            },
+        )
+        return None
+
+    out = (proc.stdout or "").strip()
+    if not out:
+        return None
+    try:
+        seconds = float(out)
+    except ValueError:
+        return None
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return round(seconds, 3)
+
+
 def _stderr_suggests_decode_corruption(stderr: str) -> bool:
     if not stderr:
         return False
@@ -1413,6 +1491,7 @@ def process_clip(
                 if job.recorded_at
                 else parse_captured_at_utc(clip_path)
             )
+            duration_seconds = probe_duration_seconds(settings, clip_path)
 
             def _run_preview_step() -> None:
                 nonlocal flags
@@ -1836,6 +1915,7 @@ def process_clip(
                         s3_key=s3_original_key,
                         preview_s3_key=s3_preview_key,
                         recorded_at=captured_at_utc,
+                        duration_seconds=duration_seconds,
                         worker_job_identity=job.job_uuid,
                     )
                 except TransientNetworkError as exc:
@@ -1921,7 +2001,9 @@ def process_clip(
                         )
                         return
                     try:
-                        booking_id = get_booking_id_for_clip(settings, captured_at_utc)
+                        booking_match = get_booking_match_for_clip(
+                            settings, captured_at_utc
+                        )
                     except TransientNetworkError as exc:
                         job_store.update_job(idem, retry_booking=job.retry_booking + 1)
                         job = job_store.get(idem)
@@ -1935,7 +2017,40 @@ def process_clip(
                             clip_path=clip_path,
                         )
                         return
+                    booking_id = booking_match.booking_id
                     if booking_id:
+                        try:
+                            upsert_booking_from_match(
+                                supabase,
+                                settings,
+                                booking_id=booking_id,
+                                start_time=booking_match.start_time,
+                                end_time=booking_match.end_time,
+                            )
+                        except TransientNetworkError as exc:
+                            job = job_store.get(idem)
+                            assert job is not None
+                            _defer_remote_sync(
+                                job_store=job_store,
+                                job=job,
+                                idempotency_key=idem,
+                                failed_step=REMOTE_STEP_BOOKING,
+                                error_message=str(exc),
+                                clip_path=clip_path,
+                            )
+                            return
+                        except Exception:
+                            logger.exception(
+                                "Failed to upsert booking row after match",
+                                extra={
+                                    "structured": {
+                                        "booking_id": booking_id,
+                                        "start_time": booking_match.start_time,
+                                        "end_time": booking_match.end_time,
+                                        "recorded_at": captured_at_utc,
+                                    }
+                                },
+                            )
                         try:
                             update_clip_booking_id(
                                 supabase,
@@ -1949,6 +2064,8 @@ def process_clip(
                                     "structured": {
                                         "clip_id": clip_id,
                                         "booking_id": booking_id,
+                                        "start_time": booking_match.start_time,
+                                        "end_time": booking_match.end_time,
                                         "recorded_at": captured_at_utc,
                                     }
                                 },
